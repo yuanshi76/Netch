@@ -8,6 +8,8 @@ namespace Netch.Models;
 
 public abstract class Server : ICloneable
 {
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+
     /// <summary>
     ///     延迟
     /// </summary>
@@ -186,5 +188,10 @@ public static class ServerExtension
     public static bool IsInGroup(this Server server)
     {
         return server.Group is not Constants.DefaultGroup;
+    }
+
+    public static bool IsComplexType(this Server server)
+    {
+        return server.ConfigType is EConfigType.PolicyGroup or EConfigType.ProxyChain;
     }
 }

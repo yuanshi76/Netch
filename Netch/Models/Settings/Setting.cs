@@ -22,6 +22,18 @@ public class Setting
     /// </summary>
     public List<Server> Server { get; set; } = new();
 
+    [Obsolete]
+    public List<Server> Servers
+    {
+        set
+        {
+            if (Server.Count == 0 && value is { Count: > 0 })
+            {
+                Server = value;
+            }
+        }
+    }
+
     public AioDNSConfig AioDNS { get; set; } = new();
 
     /// <summary>
@@ -32,7 +44,7 @@ public class Setting
     /// <summary>
     ///     是否打开软件时检查更新
     /// </summary>
-    public bool CheckUpdateWhenOpened { get; set; } = true;
+    public bool CheckUpdateWhenOpened { get; set; } = false;
 
     /// <summary>
     ///     测试所有服务器心跳/秒
@@ -78,6 +90,10 @@ public class Setting
     ///     已保存的快捷配置
     /// </summary>
     public List<Profile> Profiles { get; set; } = new();
+
+    public List<RoutingProfile> RoutingProfiles { get; set; } = new();
+
+    public string ActiveRoutingProfileId { get; set; } = string.Empty;
 
     /// <summary>
     ///     配置最大列数

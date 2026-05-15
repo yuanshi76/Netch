@@ -11,9 +11,6 @@ using Netch.Services;
 using Netch.Utils;
 using Serilog.Events;
 using SingleInstance;
-#if RELEASE
-using Windows.Win32.UI.WindowsAndMessaging;
-#endif
 
 namespace Netch;
 
@@ -59,6 +56,11 @@ public static class Program
             if (!Directory.Exists(item))
                 Directory.CreateDirectory(item);
 
+        CleanLoggingDirectory();
+
+        InitConsole();
+        CreateLogger();
+
         // load configuration
         Configuration.LoadAsync().Wait();
 
@@ -71,22 +73,6 @@ public static class Program
         }
 
         SingleInstance.Received.Subscribe(SingleInstance_ArgumentsReceived);
-
-        // clean up old logs
-        if (Directory.Exists("logging"))
-        {
-            var directory = new DirectoryInfo("logging");
-
-            foreach (var file in directory.GetFiles())
-                file.Delete();
-
-            foreach (var dir in directory.GetDirectories())
-                dir.Delete(true);
-        }
-
-        InitConsole();
-
-        CreateLogger();
 
         // load i18n
         i18N.Load(Global.Settings.Language);
@@ -164,12 +150,9 @@ public static class Program
 
     private static void InitConsole()
     {
+#if DEBUG
         PInvoke.AllocConsole();
-
         ConsoleHwnd = PInvoke.GetConsoleWindow();
-#if RELEASE
-        // hide console window
-        PInvoke.ShowWindow(ConsoleHwnd, SHOW_WINDOW_CMD.SW_HIDE);
 #endif
     }
 
@@ -188,6 +171,41 @@ public static class Program
             .MinimumLevel.Override(@"Microsoft", LogEventLevel.Information)
             .Enrich.FromLogContext()
             .CreateLogger();
+    }
+
+    private static void CleanLoggingDirectory()
+    {
+        if (!Directory.Exists("logging"))
+        {
+            return;
+        }
+
+        var directory = new DirectoryInfo("logging");
+        foreach (var file in directory.GetFiles())
+        {
+            TryDelete(() => file.Delete());
+        }
+
+        foreach (var dir in directory.GetDirectories())
+        {
+            TryDelete(() => dir.Delete(true));
+        }
+    }
+
+    private static void TryDelete(Action delete)
+    {
+        try
+        {
+            delete();
+        }
+        catch (IOException)
+        {
+            // A previous Netch/Xray process or log viewer may still hold the file.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Keep startup resilient even when a log file is temporarily locked.
+        }
     }
 
     private static void Application_OnException(object sender, ThreadExceptionEventArgs e)

@@ -27,6 +27,7 @@ public static class Configuration
 
     static Configuration()
     {
+        JsonSerializerOptions.PropertyNameCaseInsensitive = true;
         JsonSerializerOptions.Converters.Add(new ServerConverterWithTypeDiscriminator());
         JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
     }
@@ -44,14 +45,37 @@ public static class Configuration
             await using var _ = await _lock.ReadLockAsync();
 
             if (await LoadCoreAsync(FileFullName))
+            {
+                if (Global.Settings.Server.Count == 0 &&
+                    File.Exists(BackupFileFullName) &&
+                    await TryLoadSettingsAsync(BackupFileFullName) is { Server.Count: > 0 } backupSettings)
+                {
+                    CheckSetting(backupSettings);
+                    Global.Settings = backupSettings;
+                    Log.Warning(
+                        "Configuration \"{FileName}\" has no servers; restored {ServerCount} server(s) from backup \"{BackupFileName}\".",
+                        FileFullName,
+                        backupSettings.Server.Count,
+                        BackupFileFullName);
+                }
+
                 return;
+            }
 
             Log.Information("Load backup configuration \"{FileName}\"", BackupFileFullName);
-            await LoadCoreAsync(BackupFileFullName);
+            if (await LoadCoreAsync(BackupFileFullName))
+                return;
+
+            throw new InvalidDataException($"Failed to load configuration file \"{FileFullName}\" and backup \"{BackupFileFullName}\".");
         }
         catch (Exception e)
         {
             Log.Error(e, "Load configuration failed");
+            MessageBox.Show(
+                $"Load configuration failed:\n{e.Message}",
+                "Netch",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
             Environment.Exit(-1);
         }
     }
@@ -60,15 +84,18 @@ public static class Configuration
     {
         try
         {
-            Setting settings;
-
-            await using (var fs = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true))
-            {
-                settings = (await JsonSerializer.DeserializeAsync<Setting>(fs, JsonSerializerOptions))!;
-            }
+            var settings = await TryLoadSettingsAsync(filename);
+            if (settings == null)
+                return false;
 
             CheckSetting(settings);
             Global.Settings = settings;
+            Log.Information(
+                "Configuration loaded from \"{FileName}\": {ServerCount} server(s), {ProfileCount} profile(s), {RoutingProfileCount} routing profile(s)",
+                filename,
+                settings.Server.Count,
+                settings.Profiles.Count,
+                settings.RoutingProfiles.Count);
             return true;
         }
         catch (Exception e)
@@ -78,8 +105,41 @@ public static class Configuration
         }
     }
 
+    private static async Task<Setting?> TryLoadSettingsAsync(string filename)
+    {
+        await using var fs = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
+        return await JsonSerializer.DeserializeAsync<Setting>(fs, JsonSerializerOptions);
+    }
+
     private static void CheckSetting(Setting settings)
     {
+        settings.Server ??= new();
+        settings.RoutingProfiles ??= new();
+        settings.Profiles ??= new();
+
+        foreach (var server in settings.Server.Where(server => server.Id.IsNullOrWhiteSpace()))
+        {
+            server.Id = Guid.NewGuid().ToString("N");
+        }
+
+        if (settings.RoutingProfiles.Count == 0)
+        {
+            var routingProfile = new RoutingProfile();
+            settings.RoutingProfiles.Add(routingProfile);
+            settings.ActiveRoutingProfileId = routingProfile.Id;
+        }
+
+        if (settings.ActiveRoutingProfileId.IsNullOrWhiteSpace() ||
+            settings.RoutingProfiles.All(p => p.Id != settings.ActiveRoutingProfileId))
+        {
+            settings.ActiveRoutingProfileId = settings.RoutingProfiles.First().Id;
+        }
+
+        if (settings.V2RayConfig.CoreBasicItem.DestOverride.Count == 0)
+        {
+            settings.V2RayConfig.CoreBasicItem.DestOverride = ["http", "tls", "quic"];
+        }
+
         settings.Profiles.RemoveAll(p => p.ServerRemark == string.Empty || p.ModeRemark == string.Empty);
 
         if (settings.Profiles.Any(p => settings.Profiles.Any(p1 => p1 != p && p1.Index == p.Index)))
@@ -106,6 +166,18 @@ public static class Configuration
             if (!Directory.Exists(DataDirectoryFullName))
                 Directory.CreateDirectory(DataDirectoryFullName);
 
+            if (Global.Settings.Server.Count == 0 && await ExistingConfigurationHasServersAsync())
+            {
+                Log.Error(
+                    "Refused to save configuration with 0 servers because existing configuration contains servers. This prevents accidental data loss.");
+                MessageBox.Show(
+                    "Refused to save empty server configuration because the existing configuration contains servers.\nPlease back up data\\settings.json and restart Netch.",
+                    "Netch",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
             var tempFile = Path.Combine(DataDirectoryFullName, FileFullName + ".tmp");
             await using (var fileStream = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None, 4096, true))
             {
@@ -120,6 +192,28 @@ public static class Configuration
         {
             Log.Error(e, "Save Configuration error");
         }
+    }
+
+    private static async Task<bool> ExistingConfigurationHasServersAsync()
+    {
+        foreach (var filename in new[] { FileFullName, BackupFileFullName })
+        {
+            if (!File.Exists(filename))
+                continue;
+
+            try
+            {
+                var settings = await TryLoadSettingsAsync(filename);
+                if (settings?.Server.Count > 0)
+                    return true;
+            }
+            catch (Exception e)
+            {
+                Log.Warning(e, "Check existing configuration \"{FileName}\" failed", filename);
+            }
+        }
+
+        return false;
     }
 
     private static async ValueTask EnsureConfigFileExistsAsync()

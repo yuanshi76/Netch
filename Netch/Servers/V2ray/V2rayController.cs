@@ -24,9 +24,16 @@ public class V2rayController : Guard, IServerController
 
     public virtual async Task<SocksServer> StartAsync(Server s)
     {
+        var config = await V2rayConfigUtils.GenerateClientConfigAsync(s);
+        Log.Information(
+            "Generated Xray config for {ConfigType}: {OutboundCount} outbound(s): {Outbounds}",
+            s.ConfigType,
+            config.outbounds?.Count ?? 0,
+            string.Join(", ", config.outbounds?.Select(o => $"{o.tag}:{o.protocol}:dialer={o.streamSettings?.sockopt?.dialerProxy ?? "-"}") ?? []));
+
         await using (var fileStream = new FileStream(Constants.TempConfig, FileMode.Create, FileAccess.Write, FileShare.Read))
         {
-            await JsonSerializer.SerializeAsync(fileStream, await V2rayConfigUtils.GenerateClientConfigAsync(s), Global.NewCustomJsonSerializerOptions());
+            await JsonSerializer.SerializeAsync(fileStream, config, Global.NewCustomJsonSerializerOptions());
         }
 
         await StartGuardAsync("run -c ..\\data\\last.json");

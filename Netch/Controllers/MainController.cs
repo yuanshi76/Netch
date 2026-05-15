@@ -29,7 +29,7 @@ public static class MainController
 
         Log.Information("Start MainController: {Server} {Mode}", $"{server.ConfigType}", mode == null ? "Null" : $"[{(int)mode.Type}]{mode.i18NRemark}");
 
-        if (await DnsUtils.LookupAsync(server.Address) == null)
+        if (!server.IsComplexType() && await DnsUtils.LookupAsync(server.Address) == null)
             throw new MessageException(i18N.Translate("Lookup Server hostname failed"));
 
         // TODO Disable NAT Type Test setting

@@ -84,20 +84,32 @@ public static class WebUtil
         }
     }
 
-    public static async Task DownloadFileAsync(string address, string fileFullPath, IProgress<int>? progress)
+    public static async Task DownloadFileAsync(string address, string fileFullPath, IProgress<int>? progress, int? timeout = null, string? proxyServer = null)
     {
-        using var response = await _httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, address), HttpCompletionOption.ResponseHeadersRead);
-        response.EnsureSuccessStatusCode();
-        var total = response.Content.Headers.ContentLength ?? -1L;
-        await using var input = await response.Content.ReadAsStreamAsync();
-        await using var fileStream = new FileStream(fileFullPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true);
-        var copyTask = input.CopyToAsync(fileStream);
-        if (progress != null && total > 0)
+        var needsTempClient = timeout.HasValue || !string.IsNullOrWhiteSpace(proxyServer);
+        var httpClient = needsTempClient ? CreateHttpClient(timeout, proxyServer: proxyServer) : _httpClient;
+        try
         {
-            ReportProgressAsync(total, copyTask, fileStream, progress, 200).Forget();
+            using var response = await httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, address), HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+            var total = response.Content.Headers.ContentLength ?? -1L;
+            await using var input = await response.Content.ReadAsStreamAsync();
+            await using var fileStream = new FileStream(fileFullPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true);
+            var copyTask = input.CopyToAsync(fileStream);
+            if (progress != null && total > 0)
+            {
+                ReportProgressAsync(total, copyTask, fileStream, progress, 200).Forget();
+            }
+            await copyTask;
+            progress?.Report(100);
         }
-        await copyTask;
-        progress?.Report(100);
+        finally
+        {
+            if (needsTempClient)
+            {
+                httpClient.Dispose();
+            }
+        }
     }
 
     private static async Task ReportProgressAsync(long total, IAsyncResult downloadTask, Stream stream, IProgress<int> progress, int interval)

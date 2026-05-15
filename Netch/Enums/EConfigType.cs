@@ -12,4 +12,6 @@ public enum EConfigType
     HTTP,
     Anytls,
     TUIC,
+    PolicyGroup = 101,
+    ProxyChain = 102,
 }

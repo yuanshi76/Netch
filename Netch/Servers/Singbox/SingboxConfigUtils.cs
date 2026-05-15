@@ -60,6 +60,7 @@ public static class SingboxConfigUtils
         inbound.type = EInboundProtocol.mixed.ToString();
         inbound.listen = Global.Settings.LocalAddress;
         inbound.listen_port = Global.Settings.Socks5LocalPort;
+        inbound.sniff = Global.Settings.V2RayConfig.CoreBasicItem.SniffingEnabled;
         return inbound;
     }
 

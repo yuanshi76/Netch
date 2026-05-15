@@ -9,7 +9,8 @@ public static class ServerHelper
     {
         var serversUtilsTypes = Assembly.GetExecutingAssembly()
             .GetExportedTypes()
-            .Where(type => type.GetInterfaces().Contains(typeof(IServerUtil)));
+            .Where(type => type is { IsClass: true, IsAbstract: false, ContainsGenericParameters: false }
+                           && type.GetInterfaces().Contains(typeof(IServerUtil)));
 
         ServerUtilDictionary = serversUtilsTypes.Select(t => (IServerUtil)Activator.CreateInstance(t)!).ToDictionary(util => util.TypeName);
     }

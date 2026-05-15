@@ -305,7 +305,9 @@ public static class Constants
         { EConfigType.Hysteria2, "hysteria2" },
         { EConfigType.TUIC, "tuic" },
         { EConfigType.WireGuard, "wireguard" },
-        { EConfigType.Anytls, "anytls" }
+        { EConfigType.Anytls, "anytls" },
+        { EConfigType.PolicyGroup, "selector" },
+        { EConfigType.ProxyChain, "chain" }
     };
 
     public static readonly List<string> TuicCongestionControls =

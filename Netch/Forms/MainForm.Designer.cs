@@ -32,6 +32,10 @@
             MenuStrip = new MenuStrip();
             ServerToolStripMenuItem = new ToolStripMenuItem();
             ImportServersFromClipboardToolStripMenuItem = new ToolStripMenuItem();
+            ChainRoutingToolStripMenuItem = new ToolStripMenuItem();
+            AddProxyChainToolStripMenuItem = new ToolStripMenuItem();
+            AddPolicyGroupToolStripMenuItem = new ToolStripMenuItem();
+            RoutingRulesToolStripMenuItem = new ToolStripMenuItem();
             ModeToolStripMenuItem = new ToolStripMenuItem();
             CreateProcessModeToolStripMenuItem = new ToolStripMenuItem();
             CreateRouteTableRuleToolStripMenuItem = new ToolStripMenuItem();
@@ -117,7 +121,7 @@
             // 
             MenuStrip.BackColor = SystemColors.Control;
             MenuStrip.ImageScalingSize = new Size(20, 20);
-            MenuStrip.Items.AddRange(new ToolStripItem[] { ServerToolStripMenuItem, ModeToolStripMenuItem, SubscriptionToolStripMenuItem, OptionsToolStripMenuItem, HelpToolStripMenuItem, ForceExitToolStripMenuItem, AboutToolStripButton, NewVersionLabel, VersionLabel });
+            MenuStrip.Items.AddRange(new ToolStripItem[] { ServerToolStripMenuItem, ChainRoutingToolStripMenuItem, ModeToolStripMenuItem, SubscriptionToolStripMenuItem, OptionsToolStripMenuItem, HelpToolStripMenuItem, ForceExitToolStripMenuItem, AboutToolStripButton, NewVersionLabel, VersionLabel });
             MenuStrip.Location = new Point(0, 0);
             MenuStrip.Name = "MenuStrip";
             MenuStrip.RenderMode = ToolStripRenderMode.Professional;
@@ -138,6 +142,35 @@
             ImportServersFromClipboardToolStripMenuItem.Size = new Size(259, 22);
             ImportServersFromClipboardToolStripMenuItem.Text = "Import Servers From Clipboard";
             ImportServersFromClipboardToolStripMenuItem.Click += ImportServersFromClipboardToolStripMenuItem_Click;
+            // 
+            // ChainRoutingToolStripMenuItem
+            // 
+            ChainRoutingToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { AddProxyChainToolStripMenuItem, AddPolicyGroupToolStripMenuItem, RoutingRulesToolStripMenuItem });
+            ChainRoutingToolStripMenuItem.Margin = new Padding(0, 0, 0, 1);
+            ChainRoutingToolStripMenuItem.Name = "ChainRoutingToolStripMenuItem";
+            ChainRoutingToolStripMenuItem.Size = new Size(74, 21);
+            ChainRoutingToolStripMenuItem.Text = "链式/路由";
+            // 
+            // AddProxyChainToolStripMenuItem
+            // 
+            AddProxyChainToolStripMenuItem.Name = "AddProxyChainToolStripMenuItem";
+            AddProxyChainToolStripMenuItem.Size = new Size(180, 22);
+            AddProxyChainToolStripMenuItem.Text = "添加链式代理";
+            AddProxyChainToolStripMenuItem.Click += AddProxyChainToolStripMenuItem_Click;
+            // 
+            // AddPolicyGroupToolStripMenuItem
+            // 
+            AddPolicyGroupToolStripMenuItem.Name = "AddPolicyGroupToolStripMenuItem";
+            AddPolicyGroupToolStripMenuItem.Size = new Size(180, 22);
+            AddPolicyGroupToolStripMenuItem.Text = "添加策略组";
+            AddPolicyGroupToolStripMenuItem.Click += AddPolicyGroupToolStripMenuItem_Click;
+            // 
+            // RoutingRulesToolStripMenuItem
+            // 
+            RoutingRulesToolStripMenuItem.Name = "RoutingRulesToolStripMenuItem";
+            RoutingRulesToolStripMenuItem.Size = new Size(180, 22);
+            RoutingRulesToolStripMenuItem.Text = "路由规则";
+            RoutingRulesToolStripMenuItem.Click += RoutingRulesToolStripMenuItem_Click;
             // 
             // ModeToolStripMenuItem
             // 
@@ -800,6 +833,10 @@
         private System.Windows.Forms.ToolStripMenuItem ExitToolStripButton;
         private System.Windows.Forms.ToolStripMenuItem ForceExitToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem ImportServersFromClipboardToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem ChainRoutingToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem AddProxyChainToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem AddPolicyGroupToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem RoutingRulesToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem ManageSubscriptionsToolStripMenuItem;
         private System.Windows.Forms.MenuStrip MenuStrip;
         public System.Windows.Forms.ComboBox ModeComboBox;

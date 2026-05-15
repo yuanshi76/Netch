@@ -13,6 +13,12 @@ public class CoreBasicItem
 {
     public bool MuxEnabled { get; set; } = false;
 
+    public bool SniffingEnabled { get; set; } = true;
+
+    public List<string> DestOverride { get; set; } = ["http", "tls", "quic"];
+
+    public bool RouteOnly { get; set; } = false;
+
     public bool DefAllowInsecure { get; set; } = false;
 
     public string DefFingerprint { get; set; } = Constants.Fingerprints[2];

@@ -7,6 +7,7 @@ using Netch.Interfaces;
 using Netch.Models;
 using Netch.Models.Modes;
 using Netch.Properties;
+using Netch.Servers;
 using Netch.Services;
 using Netch.Utils;
 using System.ComponentModel;
@@ -34,6 +35,7 @@ public partial class MainForm : Form
         NotifyIcon.Icon = Icon = Resources.icon;
 
         AddAddServerToolStripMenuItems();
+        AddRoutingToolStripMenuItem();
 
         #region i18N Translations
 
@@ -69,6 +71,136 @@ public partial class MainForm : Form
         }
     }
 
+    private void AddRoutingToolStripMenuItem()
+    {
+        var control = new ToolStripMenuItem
+        {
+            Name = "RoutingRulesToolStripMenuItem",
+            Size = new Size(259, 22),
+            Text = "路由规则"
+        };
+
+        _mainFormText.Add(control.Name, "路由规则");
+        control.Click += RoutingRulesToolStripMenuItem_Click;
+        ServerToolStripMenuItem.DropDownItems.Add(new ToolStripSeparator());
+        ServerToolStripMenuItem.DropDownItems.Add(control);
+
+        var updateGeoData = new ToolStripMenuItem
+        {
+            Name = "UpdateGeoDataToolStripMenuItem",
+            Size = new Size(180, 22),
+            Text = "更新 GeoSite/GeoIP 数据（直连）"
+        };
+
+        _mainFormText.Add(updateGeoData.Name, "更新 GeoSite/GeoIP 数据（直连）");
+        updateGeoData.Click += UpdateGeoDataToolStripMenuItem_Click;
+
+        var updateGeoDataUseProxy = new ToolStripMenuItem
+        {
+            Name = "UpdateGeoDataUseProxyToolStripMenuItem",
+            Size = new Size(180, 22),
+            Text = "更新 GeoSite/GeoIP 数据（使用当前代理）"
+        };
+
+        _mainFormText.Add(updateGeoDataUseProxy.Name, "更新 GeoSite/GeoIP 数据（使用当前代理）");
+        updateGeoDataUseProxy.Click += UpdateGeoDataUseProxyToolStripMenuItem_Click;
+        ChainRoutingToolStripMenuItem.DropDownItems.Add(new ToolStripSeparator());
+        ChainRoutingToolStripMenuItem.DropDownItems.Add(updateGeoData);
+        ChainRoutingToolStripMenuItem.DropDownItems.Add(updateGeoDataUseProxy);
+    }
+
+    private async void RoutingRulesToolStripMenuItem_Click(object? sender, EventArgs e)
+    {
+        Hide();
+        new RoutingForm().ShowDialog();
+        await Configuration.SaveAsync();
+        Show();
+    }
+
+    private async void AddProxyChainToolStripMenuItem_Click(object? sender, EventArgs e)
+    {
+        Hide();
+        new GroupServerForm(new ProxyChainServer(), EConfigType.ProxyChain).ShowDialog();
+        LoadServers();
+        await Configuration.SaveAsync();
+        Show();
+    }
+
+    private async void AddPolicyGroupToolStripMenuItem_Click(object? sender, EventArgs e)
+    {
+        Hide();
+        new GroupServerForm(new PolicyGroupServer(), EConfigType.PolicyGroup).ShowDialog();
+        LoadServers();
+        await Configuration.SaveAsync();
+        Show();
+    }
+
+    private async void UpdateGeoDataToolStripMenuItem_Click(object? sender, EventArgs e)
+    {
+        await UpdateGeoDataAsync();
+    }
+
+    private async void UpdateGeoDataUseProxyToolStripMenuItem_Click(object? sender, EventArgs e)
+    {
+        if (State == State.Started)
+        {
+            await UpdateGeoDataAsync($"127.0.0.1:{Global.Settings.Socks5LocalPort}");
+            return;
+        }
+
+        if (ServerComboBox.SelectedItem is not Server server)
+        {
+            MessageBoxX.Show(i18N.Translate("Please select a server first"));
+            return;
+        }
+
+        Enabled = false;
+        try
+        {
+            StatusText("正在启动当前代理用于更新 GeoSite/GeoIP 数据");
+            await MainController.StartAsync(server);
+            await UpdateGeoDataAsync($"127.0.0.1:{Global.Settings.Socks5LocalPort}", false);
+        }
+        catch (Exception exception)
+        {
+            NotifyTip("GeoSite/GeoIP 数据更新失败\n" + exception.Message, info: false);
+            Log.Error(exception, "Update GeoSite/GeoIP data with proxy failed");
+        }
+        finally
+        {
+            await StopCoreAsync();
+            Enabled = true;
+        }
+    }
+
+    private async Task UpdateGeoDataAsync(string? proxyServer = null, bool manageEnabled = true)
+    {
+        if (manageEnabled)
+        {
+            Enabled = false;
+        }
+
+        StatusText("正在更新 GeoSite/GeoIP 数据");
+        try
+        {
+            await GeoDataUpdateUtil.UpdateAsync(proxyServer: proxyServer);
+            StatusText("GeoSite/GeoIP 数据更新完成");
+            NotifyTip("GeoSite/GeoIP 数据更新完成");
+        }
+        catch (Exception exception)
+        {
+            NotifyTip("GeoSite/GeoIP 数据更新失败\n" + exception.Message, info: false);
+            Log.Error(exception, "Update GeoSite/GeoIP data failed");
+        }
+        finally
+        {
+            if (manageEnabled)
+            {
+                Enabled = true;
+            }
+        }
+    }
+
     private void MainForm_Load(object sender, EventArgs e)
     {
         // 计算 ComboBox绘制 目标宽度
@@ -88,10 +220,6 @@ public partial class MainForm : Form
 
         // 加载快速配置
         LoadProfiles();
-
-        // 检查更新
-        if (Global.Settings.CheckUpdateWhenOpened)
-            CheckUpdateAsync().Forget();
 
         // 检查订阅更新
         if (Global.Settings.UpdateServersWhenOpened)
@@ -781,6 +909,17 @@ public partial class MainForm : Form
         }
 
         Global.Settings.Server.Remove(server);
+        foreach (var item in Global.Settings.Server.Where(s => s.IsComplexType()))
+        {
+            var childIds = Utils.Utils.String2List(item.ProtoExtra.ChildItems) ?? [];
+            item.ProtoExtra.ChildItems = string.Join(",", childIds.Where(id => id != server.Id));
+        }
+
+        foreach (var routingProfile in Global.Settings.RoutingProfiles)
+        {
+            routingProfile.Rules.RemoveAll(rule => rule.OutboundServerId == server.Id);
+        }
+
         LoadServers();
     }
 

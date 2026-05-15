@@ -9,12 +9,22 @@ namespace Netch.Servers;
 
 public static class V2rayConfigUtils
 {
+    private const string ProxyTag = RoutingOutbound.Proxy;
+    private const string DirectTag = RoutingOutbound.Direct;
+    private const string BlockTag = RoutingOutbound.Block;
+    private const string BalancerPrefix = "balancer:";
+
     public static async Task<V2rayConfig> GenerateClientConfigAsync(Server server)
     {
+        if (GroupServerHelper.IsSecondaryOnlyProxy(server))
+        {
+            throw new MessageException(GroupServerHelper.PrimaryProxyValidationMessage(server));
+        }
+
         var v2rayConfig = new V2rayConfig();
         v2rayConfig.log = new Log4Ray
         {
-            loglevel = Constants.LogLevels[2]
+            loglevel = server.IsComplexType() ? Constants.LogLevels[0] : Constants.LogLevels[2]
         };
 
         if (!Utils.Utils.IsIp(server.Address) && 
@@ -41,10 +51,409 @@ public static class V2rayConfigUtils
 
         v2rayConfig.inbounds = [GenerateInbound()];
 
-        v2rayConfig.outbounds = [await GenerateOutbound(server)];
+        v2rayConfig.outbounds = await BuildAllProxyOutbounds(server, ProxyTag, []);
+        v2rayConfig.routing = await GenerateRoutingAsync(v2rayConfig, server);
 
 
         return v2rayConfig;
+    }
+
+    private static async Task<List<Outbounds4Ray>> BuildAllProxyOutbounds(Server server, string baseTagName, HashSet<string> stack)
+    {
+        if (!stack.Add(server.Id))
+        {
+            throw new MessageException("Proxy chain contains a cycle.");
+        }
+
+        try
+        {
+            return server.ConfigType switch
+            {
+                EConfigType.ProxyChain => await BuildChainOutbounds(server, baseTagName, stack),
+                EConfigType.PolicyGroup => await BuildPolicyGroupOutbounds(server, baseTagName, stack),
+                _ => [await BuildProxyOutbound(server, baseTagName)]
+            };
+        }
+        finally
+        {
+            stack.Remove(server.Id);
+        }
+    }
+
+    private static async Task<Outbounds4Ray> BuildProxyOutbound(Server server, string tag)
+    {
+        var outbound = await GenerateOutbound(server);
+        outbound.tag = tag;
+        return outbound;
+    }
+
+    private static async Task<List<Outbounds4Ray>> BuildChainOutbounds(Server server, string baseTagName, HashSet<string> stack)
+    {
+        var childIds = GroupServerHelper.ChildIds(server);
+        var nodes = GroupServerHelper.ChildServers(server);
+        var missingIds = childIds.Where(id => nodes.All(s => s.Id != id)).ToList();
+        if (missingIds.Count > 0)
+        {
+            throw new MessageException($"Proxy chain contains missing server reference(s): {string.Join(", ", missingIds)}");
+        }
+
+        if (nodes.Count < 2)
+        {
+            throw new MessageException($"Proxy chain requires at least two available servers. Current count: {nodes.Count}.");
+        }
+
+        if (GroupServerHelper.IsSecondaryOnlyProxy(nodes[0]))
+        {
+            throw new MessageException(GroupServerHelper.PrimaryProxyValidationMessage(nodes[0]));
+        }
+
+        Log.Information(
+            "Build proxy chain {Remark}: {Nodes}",
+            server.Remarks,
+            string.Join(" -> ", nodes.Select(s => $"{s.ConfigType}:{s.Remarks}:{s.Id}")));
+
+        // UI order is user-facing network order: local -> first hop -> ... -> final exit.
+        // Xray dialerProxy works in the opposite direction: the final outbound is tagged
+        // as proxy, and it dials through the previous hop.
+        var nodesReverse = nodes.AsEnumerable().Reverse().ToList();
+        var outbounds = new List<Outbounds4Ray>();
+        for (var i = 0; i < nodesReverse.Count; i++)
+        {
+            var node = nodesReverse[i];
+            var currentTag = i == 0 ? baseTagName : $"chain-{baseTagName}-{i}-{SafeTagPart(node)}";
+            var dialerProxyTag = i != nodesReverse.Count - 1 ? $"chain-{baseTagName}-{i + 1}-{SafeTagPart(nodesReverse[i + 1])}" : null;
+
+            var nodeOutbounds = await BuildAllProxyOutbounds(node, currentTag, stack);
+            if (!dialerProxyTag.IsNullOrWhiteSpace())
+            {
+                foreach (var chainEndNode in nodeOutbounds.Where(o => o.streamSettings?.sockopt?.dialerProxy.IsNullOrWhiteSpace() ?? true))
+                {
+                    FillDialerProxy(chainEndNode, dialerProxyTag);
+                }
+            }
+
+            outbounds.AddRange(nodeOutbounds);
+        }
+
+        return outbounds;
+    }
+
+    private static async Task<List<Outbounds4Ray>> BuildPolicyGroupOutbounds(Server server, string baseTagName, HashSet<string> stack)
+    {
+        var nodes = GroupServerHelper.ChildServers(server);
+        if (nodes.Count < 1)
+        {
+            throw new MessageException("Policy group requires at least one available server.");
+        }
+
+        var outbounds = new List<Outbounds4Ray>();
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            var tag = nodes.Count == 1 ? baseTagName : $"{baseTagName}-{i + 1}-{SafeTagPart(nodes[i])}";
+            outbounds.AddRange(await BuildAllProxyOutbounds(nodes[i], tag, stack));
+        }
+
+        return outbounds;
+    }
+
+    private static async Task<Routing4Ray?> GenerateRoutingAsync(V2rayConfig v2rayConfig, Server activeServer)
+    {
+        var routingProfile = Global.Settings.RoutingProfiles
+            .FirstOrDefault(p => p.Id == Global.Settings.ActiveRoutingProfileId && p.Enabled);
+        var enabledRules = routingProfile?.Rules.Where(r => r.Enabled).ToList() ?? [];
+        var userRules = enabledRules.Where(HasRoutingMatcher).ToList();
+        Log.Information(
+            "Build routing profile {Profile}: {EnabledRules} enabled rule(s), {EffectiveRules} effective rule(s)",
+            routingProfile?.Remarks ?? "-",
+            enabledRules.Count,
+            userRules.Count);
+        EnsureGeoDataAvailable(userRules);
+        var rules = new List<RulesItem4Ray>();
+        var balancers = new List<BalancersItem4Ray>();
+        var needsDirect = false;
+        var needsBlock = false;
+
+        foreach (var rule in userRules)
+        {
+            var outboundTag = await ResolveRoutingOutboundTagAsync(rule.OutboundServerId, v2rayConfig, activeServer);
+            needsDirect |= outboundTag == DirectTag;
+            needsBlock |= outboundTag == BlockTag;
+
+            string? balancerTag = null;
+            if (outboundTag.StartsWith(BalancerPrefix, StringComparison.Ordinal))
+            {
+                var baseTag = outboundTag[BalancerPrefix.Length..];
+                balancerTag = EnsureBalancer(v2rayConfig, balancers, baseTag);
+                outboundTag = string.Empty;
+            }
+
+            var item = BuildRoutingRule(rule, outboundTag, balancerTag);
+            if (item != null)
+            {
+                rules.Add(item);
+                Log.Information(
+                    "Routing rule {Remark}: {Matchers} -> {Target}",
+                    rule.Remarks.IsNullOrWhiteSpace() ? "-" : rule.Remarks,
+                    DescribeRoutingRule(rule),
+                    balancerTag ?? outboundTag);
+            }
+        }
+
+        if (v2rayConfig.outbounds.Any(o => o.protocol == "http"))
+        {
+            rules.Add(new RulesItem4Ray
+            {
+                type = "field",
+                network = "udp",
+                outboundTag = BlockTag
+            });
+            needsBlock = true;
+            Log.Information("Routing adds HTTP outbound UDP fallback block after user rules.");
+        }
+
+        if (activeServer.ConfigType == EConfigType.PolicyGroup && v2rayConfig.outbounds.Count > 1)
+        {
+            var balancerTag = EnsureBalancer(v2rayConfig, balancers, ProxyTag);
+            rules.Add(new RulesItem4Ray
+            {
+                type = "field",
+                network = "tcp,udp",
+                balancerTag = balancerTag
+            });
+        }
+
+        if (rules.Count == 0)
+        {
+            if (enabledRules.Count > 0)
+            {
+                Log.Warning("No Xray routing rules generated because enabled routing rules have no matcher fields.");
+            }
+
+            return null;
+        }
+
+        if (needsDirect && v2rayConfig.outbounds.All(o => o.tag != DirectTag))
+        {
+            v2rayConfig.outbounds.Add(BuildDirectOutbound());
+        }
+
+        if (needsBlock && v2rayConfig.outbounds.All(o => o.tag != BlockTag))
+        {
+            v2rayConfig.outbounds.Add(BuildBlockOutbound());
+        }
+
+        return new Routing4Ray
+        {
+            domainStrategy = "AsIs",
+            rules = rules,
+            balancers = balancers.Count > 0 ? balancers : null
+        };
+    }
+
+    private static bool HasRoutingMatcher(RoutingRule rule)
+    {
+        return rule.Domain.Count > 0 ||
+               rule.Ip.Count > 0 ||
+               !rule.Port.IsNullOrWhiteSpace() ||
+               !rule.Network.IsNullOrWhiteSpace() ||
+               rule.Protocol.Count > 0 ||
+               rule.InboundTag.Count > 0 ||
+               rule.Process.Count > 0;
+    }
+
+    private static string DescribeRoutingRule(RoutingRule rule)
+    {
+        var parts = new List<string>();
+        if (rule.Domain.Count > 0)
+        {
+            parts.Add($"domain=[{string.Join(",", rule.Domain)}]");
+        }
+
+        if (rule.Ip.Count > 0)
+        {
+            parts.Add($"ip=[{string.Join(",", rule.Ip)}]");
+        }
+
+        if (!rule.Port.IsNullOrWhiteSpace())
+        {
+            parts.Add($"port={rule.Port}");
+        }
+
+        if (!rule.Network.IsNullOrWhiteSpace())
+        {
+            parts.Add($"network={rule.Network}");
+        }
+
+        if (rule.Protocol.Count > 0)
+        {
+            parts.Add($"protocol=[{string.Join(",", rule.Protocol)}]");
+        }
+
+        if (rule.InboundTag.Count > 0)
+        {
+            parts.Add($"inboundTag=[{string.Join(",", rule.InboundTag)}]");
+        }
+
+        if (rule.Process.Count > 0)
+        {
+            parts.Add($"process=[{string.Join(",", rule.Process)}]");
+        }
+
+        return parts.Count > 0 ? string.Join("; ", parts) : "-";
+    }
+
+    private static void EnsureGeoDataAvailable(IEnumerable<RoutingRule> rules)
+    {
+        var needsGeoSite = rules.Any(rule => rule.Domain.Any(IsGeoSiteRule));
+        var needsGeoIp = rules.Any(rule => rule.Ip.Any(IsGeoIpRule));
+
+        if (needsGeoSite && !GeoDataUpdateUtil.HasGeoSite)
+        {
+            throw new MessageException("路由规则使用了 geosite，但 bin\\geosite.dat 不存在。请先在“链式/路由”菜单中更新 GeoSite/GeoIP 数据。");
+        }
+
+        if (needsGeoIp && !GeoDataUpdateUtil.HasGeoIp)
+        {
+            throw new MessageException("路由规则使用了 geoip，但 bin\\geoip.dat 不存在。请先在“链式/路由”菜单中更新 GeoSite/GeoIP 数据。");
+        }
+    }
+
+    private static bool IsGeoSiteRule(string value)
+    {
+        return value.StartsWith("geosite:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGeoIpRule(string value)
+    {
+        return value.StartsWith("geoip:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<string> ResolveRoutingOutboundTagAsync(string outboundServerId, V2rayConfig v2rayConfig, Server activeServer)
+    {
+        if (outboundServerId.IsNullOrWhiteSpace() || outboundServerId == ProxyTag)
+        {
+            return ProxyTag;
+        }
+
+        if (outboundServerId is DirectTag or BlockTag)
+        {
+            return outboundServerId;
+        }
+
+        var server = Global.Settings.Server.FirstOrDefault(s => s.Id == outboundServerId);
+        if (server == null)
+        {
+            return ProxyTag;
+        }
+
+        var tag = $"{server.Id}-{ProxyTag}-{SafeTagPart(server)}";
+        if (v2rayConfig.outbounds.Any(o => o.tag != null && o.tag.StartsWith(tag, StringComparison.Ordinal)))
+        {
+            return tag;
+        }
+
+        var outbounds = await BuildAllProxyOutbounds(server, tag, []);
+        v2rayConfig.outbounds.AddRange(outbounds);
+        return server.ConfigType == EConfigType.PolicyGroup && outbounds.Count > 1 ? $"{BalancerPrefix}{tag}" : tag;
+    }
+
+    private static RulesItem4Ray? BuildRoutingRule(RoutingRule rule, string outboundTag, string? balancerTag)
+    {
+        var item = new RulesItem4Ray
+        {
+            type = "field",
+            outboundTag = outboundTag.NullIfEmpty(),
+            balancerTag = balancerTag,
+            port = rule.Port.NullIfEmpty(),
+            network = rule.Network.NullIfEmpty(),
+            domain = rule.Domain.Count > 0 ? rule.Domain : null,
+            ip = rule.Ip.Count > 0 ? rule.Ip : null,
+            protocol = rule.Protocol.Count > 0 ? rule.Protocol : null,
+            inboundTag = rule.InboundTag.Count > 0 ? rule.InboundTag : null,
+            process = rule.Process.Count > 0 ? rule.Process : null
+        };
+
+        if (item.port == null &&
+            item.network == null &&
+            item.domain == null &&
+            item.ip == null &&
+            item.protocol == null &&
+            item.inboundTag == null &&
+            item.process == null)
+        {
+            return null;
+        }
+
+        return item;
+    }
+
+    private static string EnsureBalancer(V2rayConfig v2rayConfig, List<BalancersItem4Ray> balancers, string baseTag)
+    {
+        var balancerTag = $"{baseTag}-balancer";
+        if (balancers.Any(b => b.tag == balancerTag))
+        {
+            return balancerTag;
+        }
+
+        var selector = v2rayConfig.outbounds
+            .Where(o => o.tag == baseTag || (o.tag?.StartsWith($"{baseTag}-", StringComparison.Ordinal) ?? false))
+            .Select(o => o.tag)
+            .Where(tag => !tag.IsNullOrWhiteSpace())
+            .ToList();
+
+        balancers.Add(new BalancersItem4Ray
+        {
+            tag = balancerTag,
+            selector = selector,
+            strategy = new BalancersStrategy4Ray
+            {
+                type = "leastPing"
+            }
+        });
+
+        return balancerTag;
+    }
+
+    private static Outbounds4Ray BuildDirectOutbound()
+    {
+        return new Outbounds4Ray
+        {
+            tag = DirectTag,
+            protocol = "freedom",
+            settings = new Outboundsettings4Ray()
+        };
+    }
+
+    private static Outbounds4Ray BuildBlockOutbound()
+    {
+        return new Outbounds4Ray
+        {
+            tag = BlockTag,
+            protocol = "blackhole",
+            settings = new Outboundsettings4Ray
+            {
+                response = new Response4Ray
+                {
+                    type = "none"
+                }
+            }
+        };
+    }
+
+    private static void FillDialerProxy(Outbounds4Ray outbound, string dialerProxyTag)
+    {
+        outbound.streamSettings ??= new StreamSettings4Ray();
+        outbound.streamSettings.sockopt ??= new Sockopt4Ray();
+        outbound.streamSettings.sockopt.dialerProxy = dialerProxyTag;
+    }
+
+    private static string SafeTagPart(Server server)
+    {
+        var id = server.Id.IsNullOrWhiteSpace()
+            ? Guid.NewGuid().ToString("N")
+            : server.Id;
+
+        return $"{server.ConfigType.ToString().ToLowerInvariant()}-{id[..Math.Min(12, id.Length)]}";
     }
 
     private static async Task<Outbounds4Ray> GenerateOutbound(Server server)
@@ -571,8 +980,20 @@ public static class V2rayConfigUtils
         inbound.settings = new Inboundsettings4Ray();
         inbound.settings.auth = "noauth";
         inbound.settings.udp = true;
+        inbound.sniffing = GenerateSniffing();
 
         return inbound;
+    }
+
+    private static Sniffing4Ray GenerateSniffing()
+    {
+        var item = Global.Settings.V2RayConfig.CoreBasicItem;
+        return new Sniffing4Ray
+        {
+            enabled = item.SniffingEnabled,
+            destOverride = item.DestOverride.Count > 0 ? item.DestOverride : ["http", "tls", "quic"],
+            routeOnly = item.RouteOnly
+        };
     }
 
     private static void GenOutboundMux(Outbounds4Ray outbound, bool enabledTCP = false, bool enabledUDP = false)
