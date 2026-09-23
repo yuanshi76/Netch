@@ -14,6 +14,7 @@ public partial class SettingForm : BindingForm
         _mainForm = mainForm;
         Icon = Resources.icon;
         i18N.TranslateForm(this);
+        InitializeDnsSettings();
 
         #region General
 
@@ -274,7 +275,7 @@ public partial class SettingForm : BindingForm
 
         #region Check
 
-        var checkNotPassControl = GetInvalidateValueControls();
+        var checkNotPassControl = GetInvalidateValueControls().Where(c => c.Enabled).ToList();
 
         if (checkNotPassControl.Any())
         {
@@ -300,6 +301,8 @@ public partial class SettingForm : BindingForm
 
         #region Save
 
+        try { Global.Settings.DnsPolicy = ReadDnsSettings(); }
+        catch (Exception ex) { MessageBoxX.Show(ex.Message); return; }
         SaveBinds();
 
         #endregion

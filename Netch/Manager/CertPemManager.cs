@@ -214,15 +214,14 @@ public class CertPemManager
             using var cts = new CancellationTokenSource();
             cts.CancelAfter(TimeSpan.FromSeconds(timeout));
 
-            using var client = new TcpClient();
-            await client.ConnectAsync(domain, port > 0 ? port : 443, cts.Token);
-
-            using var ssl = new SslStream(client.GetStream(), false, ValidateServerCertificate);
+            await using var stream = await ConnectForCertificateAsync(domain, port > 0 ? port : 443, cts.Token);
+            using var ssl = new SslStream(stream, false);
 
             var sslOptions = new SslClientAuthenticationOptions
             {
                 TargetHost = serverName,
-                RemoteCertificateValidationCallback = ValidateServerCertificate
+                RemoteCertificateValidationCallback = ValidateServerCertificate,
+                CertificateChainPolicy = Netch.Services.Dns.RemoteDnsTransport.OfflineCertificatePolicy()
             };
 
             await ssl.AuthenticateAsClientAsync(sslOptions, cts.Token);
@@ -261,15 +260,14 @@ public class CertPemManager
             using var cts = new CancellationTokenSource();
             cts.CancelAfter(TimeSpan.FromSeconds(timeout));
 
-            using var client = new TcpClient();
-            await client.ConnectAsync(domain, port > 0 ? port : 443, cts.Token);
-
-            using var ssl = new SslStream(client.GetStream(), false, ValidateServerCertificate);
+            await using var stream = await ConnectForCertificateAsync(domain, port > 0 ? port : 443, cts.Token);
+            using var ssl = new SslStream(stream, false);
 
             var sslOptions = new SslClientAuthenticationOptions
             {
                 TargetHost = serverName,
-                RemoteCertificateValidationCallback = ValidateServerCertificate
+                RemoteCertificateValidationCallback = ValidateServerCertificate,
+                CertificateChainPolicy = Netch.Services.Dns.RemoteDnsTransport.OfflineCertificatePolicy()
             };
 
             await ssl.AuthenticateAsClientAsync(sslOptions, cts.Token);
@@ -279,7 +277,8 @@ public class CertPemManager
                 return (pemList, null);
             }
 
-            var chain = new X509Chain();
+            using var chain = new X509Chain();
+            chain.ChainPolicy = Netch.Services.Dns.RemoteDnsTransport.OfflineCertificatePolicy();
             chain.Build(certChain);
 
             foreach (var element in chain.ChainElements)
@@ -326,12 +325,13 @@ public class CertPemManager
         var cert2 = certificate as X509Certificate2 ?? new X509Certificate2(certificate);
         var certChain = chain ?? new X509Chain();
 
-        certChain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
+        certChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        certChain.ChainPolicy.DisableCertificateDownloads = true;
         certChain.ChainPolicy.RevocationFlag = X509RevocationFlag.ExcludeRoot;
         certChain.ChainPolicy.VerificationFlags = X509VerificationFlags.NoFlag;
         certChain.ChainPolicy.VerificationTime = DateTime.Now;
 
-        certChain.Build(cert2);
+        if (!certChain.Build(cert2)) return false;
 
         // Find root CA
         if (certChain.ChainElements.Count == 0)
@@ -343,6 +343,18 @@ public class CertPemManager
         var rootThumbprint = rootCert.GetCertHashString(HashAlgorithmName.SHA256);
 
         return TrustedCaThumbprints.Contains(rootThumbprint);
+    }
+
+    private static async Task<Stream> ConnectForCertificateAsync(string host, int port, CancellationToken token)
+    {
+        if (Netch.Services.Dns.DnsRuntime.Strict)
+        {
+            if (!Netch.Services.Dns.DnsRuntime.TransportReady) throw new IOException("本地解析已关闭，请先连接代理再获取证书。");
+            return await Netch.Services.Dns.SocksConnector.ConnectAsync(Netch.Services.Dns.DnsRuntime.TransportPort, host, port, token);
+        }
+        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        try { await socket.ConnectAsync(host, port, token); return new NetworkStream(socket, true); }
+        catch { socket.Dispose(); throw; }
     }
 
     public static string ExportCertToPem(X509Certificate2 cert)

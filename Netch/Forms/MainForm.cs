@@ -9,6 +9,7 @@ using Netch.Models.Modes;
 using Netch.Properties;
 using Netch.Servers;
 using Netch.Services;
+using Netch.Services.Dns;
 using Netch.Utils;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -36,6 +37,22 @@ public partial class MainForm : Form
 
         AddAddServerToolStripMenuItems();
         AddRoutingToolStripMenuItem();
+        var restoreDnsItem = new ToolStripMenuItem("停止并恢复系统 DNS");
+        restoreDnsItem.Click += async (_, _) =>
+        {
+            restoreDnsItem.Enabled = false;
+            try { await RestoreDnsAsync(); }
+            catch (Exception ex) { MessageBoxX.Show(ex.Message); }
+            finally { restoreDnsItem.Enabled = true; }
+        };
+        ServerToolStripMenuItem.DropDownItems.Add(restoreDnsItem);
+        DnsRuntime.StatusChanged += DnsStatusChanged;
+        FormClosed += (_, _) => DnsRuntime.StatusChanged -= DnsStatusChanged;
+        Shown += (_, _) =>
+        {
+            if (DnsRuntime.Protection.Active)
+                MessageBoxX.Show("检测到保留的 DNS 保护。重新连接代理可继续使用；需要恢复普通联网，请选择“服务器 → 停止并恢复系统 DNS”。");
+        };
 
         #region i18N Translations
 
@@ -1252,6 +1269,19 @@ public partial class MainForm : Form
         await StopCoreAsync();
     }
 
+    public async Task RestoreDnsAsync()
+    {
+        await StopCoreAsync();
+        await MainController.RestoreDnsAsync();
+        StatusText(DnsRuntime.Status);
+    }
+
+    private void DnsStatusChanged(string text)
+    {
+        try { if (!IsDisposed && IsHandleCreated) StatusText(text); }
+        catch (InvalidOperationException) when (Disposing || IsDisposed) { }
+    }
+
     private async Task StopCoreAsync()
     {
         State = State.Stopping;
@@ -1280,7 +1310,9 @@ public partial class MainForm : Form
             return;
         }
 
-        text ??= i18N.Translate(StateExtension.GetStatusString(State));
+        text ??= DnsRuntime.Protection.Active && !DnsRuntime.TransportReady
+            ? "DNS 保护保持；恢复普通联网请使用“停止并恢复系统 DNS”"
+            : i18N.Translate(StateExtension.GetStatusString(State));
         if (_state == State.Started)
             text += StatusPortInfoText.Value;
 

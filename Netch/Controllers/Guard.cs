@@ -11,6 +11,10 @@ public abstract class Guard
 {
     private FileStream? _logFileStream;
     private StreamWriter? _logStreamWriter;
+    private readonly SemaphoreSlim _logLock = new(1);
+    private Task _outputTask = Task.CompletedTask;
+    private bool _started;
+    private bool _disposed;
 
     /// <param name="mainFile">application path relative of Netch\bin</param>
     /// <param name="redirectOutput"></param>
@@ -64,6 +68,7 @@ public abstract class Guard
 
         Instance.StartInfo.Arguments = argument;
         Instance.Start();
+        _started = true;
         Global.Job.AddProcess(Instance);
 
         if (priority != ProcessPriorityClass.Normal)
@@ -71,8 +76,7 @@ public abstract class Guard
 
         if (RedirectOutput)
         {
-            ReadOutputAsync(Instance.StandardOutput).Forget();
-            ReadOutputAsync(Instance.StandardError).Forget();
+            _outputTask = Task.WhenAll(ReadOutputAsync(Instance.StandardOutput), ReadOutputAsync(Instance.StandardError));
 
             if (!StartedKeywords.Any())
             {
@@ -85,19 +89,18 @@ public abstract class Guard
             for (var i = 0; i < 1000; i++)
             {
                 await Task.Delay(50);
+                if (Instance.HasExited) State = State.Stopped;
                 switch (State)
                 {
                     case State.Started:
                         OnStarted();
                         return;
                     case State.Stopped:
-                        await StopGuardAsync();
                         OnStartFailed();
                         throw new MessageException($"{Name} 控制器启动失败");
                 }
             }
 
-            await StopGuardAsync();
             throw new MessageException($"{Name} 控制器启动超时");
         }
     }
@@ -107,7 +110,9 @@ public abstract class Guard
         string? line;
         while ((line = await reader.ReadLineAsync()) != null)
         {
-            await _logStreamWriter!.WriteLineAsync(line);
+            await _logLock.WaitAsync();
+            try { if (_logStreamWriter != null) await _logStreamWriter.WriteLineAsync(line); }
+            finally { _logLock.Release(); }
             OnReadNewLine(line);
 
             if (State == State.Starting)
@@ -129,10 +134,12 @@ public abstract class Guard
     }
 
     protected async Task StopGuardAsync()
-    {       
+    {
+        if (_disposed) return;
+        _disposed = true;
         try
         {
-            if (Instance is { HasExited: false })
+            if (_started && !Instance.HasExited)
             {
                 Instance.Kill();
                 await Instance.WaitForExitAsync();
@@ -140,19 +147,25 @@ public abstract class Guard
         }
         catch (Exception e)
         {
-            Log.Error(e, "Stop {Name} failed", Instance.ProcessName);
+            Log.Error(e, "Stop {Name} failed", Name);
+            _disposed = false;
+            throw new MessageException($"无法停止 {Name}：{e.Message}");
         }
         finally
         {
-            if (_logStreamWriter != null)
-                await _logStreamWriter.DisposeAsync();
+            if (_disposed)
+            {
+                try { await _outputTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch (Exception ex) { Log.Warning(ex, "Core output cleanup failed"); }
+                if (_logStreamWriter != null)
+                    await _logStreamWriter.DisposeAsync();
 
-            if (_logFileStream != null)
-                await _logFileStream.DisposeAsync();
+                if (_logFileStream != null)
+                    await _logFileStream.DisposeAsync();
 
-            Instance.Dispose();
+                Instance.Dispose();
 
-            State = State.Stopped;
+                State = State.Stopped;
+            }
         }
     }
 

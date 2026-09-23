@@ -2,6 +2,7 @@
 using Netch.Manager;
 using Netch.Models;
 using Netch.Utils;
+using Netch.Services.Dns;
 using System.Text.RegularExpressions;
 
 #pragma warning disable VSTHRD200
@@ -19,35 +20,23 @@ public static class SingboxConfigUtils
             level = Constants.LogLevels[2]
         };
 
-        if (!Utils.Utils.IsIp(server.Address) &&
-            Global.Settings.OutboundDNS_Enabled &&
-            Global.Settings.OutboundDNS_UseDomainName &&
-            !Global.Settings.OutboundDNS.ToLowerInvariant().StartsWith("tls://"))
+        singboxConfig.dns = new Dns4Sbox
         {
-            singboxConfig.dns = new Dns4Sbox()
-            {
-                servers = [
-                new Server4Sbox
-                {
-                    address = Global.Settings.OutboundDNS,
-                    type = "udp",
-                    tag = "OutboundServer"
-                }
-            ],
-                rules = [
-                new Rule4Sbox
-                {
-                    server = "OutboundServer",
-                    domain = [$"{server.Address}"]
-                }
-            ]
-
-            };
-        }
-
-        singboxConfig.inbounds = [GenerateInbound()];
+            servers = [new Server4Sbox { type = "tcp", tag = "dns-policy", server = "127.0.0.1", server_port = 53 }],
+            final = "dns-policy", disable_cache = true
+        };
+        singboxConfig.inbounds = [GenerateInbound(), new Inbound4Sbox
+        {
+            tag = RemoteDnsService.TransportTag, type = "socks", listen = "127.0.0.1", listen_port = DnsRuntime.TransportPort
+        }];
 
         singboxConfig.outbounds = [await GenerateOutbound(server)];
+        singboxConfig.outbounds[0].tag = "proxy";
+        singboxConfig.route = new Route4Sbox
+        {
+            default_domain_resolver = new Rule4Sbox { server = "dns-policy" },
+            final = "proxy", rules = [new Rule4Sbox { inbound = [RemoteDnsService.TransportTag], action = "route", outbound = "proxy" }]
+        };
 
 
         return singboxConfig;
@@ -68,14 +57,9 @@ public static class SingboxConfigUtils
     {
         var protocolExtra = node.ProtoExtra;
 
-        var ipAddress = node.Address;
-
-        if (Global.Settings.OutboundDNS_Enabled)
-        {
-            if (!Global.Settings.OutboundDNS_UseDomainName ||
-                (Global.Settings.OutboundDNS_UseDomainName && Global.Settings.OutboundDNS.ToLowerInvariant().StartsWith("tls://")))
-                ipAddress = (await DnsUtils.LookupAsync(node.Address)).ToString();
-        }
+        if (DnsRuntime.Strict && new[] { 53, 853, 5353, 5355, 137 }.Contains(node.Port))
+            throw new MessageException("节点端口与严格 DNS 阻断端口冲突，请使用其他代理端口。");
+        var ipAddress = await DnsRuntime.ConnectionAddressAsync(node.Address);
 
         var outbound = new Outbound4Sbox
         {
@@ -411,7 +395,7 @@ public static class SingboxConfigUtils
             {
                 return;
             }
-            var server_name = string.Empty;
+            var server_name = node.Address;
             if (node.Sni.IsNotEmpty())
             {
                 server_name = node.Sni;

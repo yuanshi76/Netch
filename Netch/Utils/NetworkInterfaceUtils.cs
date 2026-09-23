@@ -46,11 +46,13 @@ public static class NetworkInterfaceUtils
         if (metric != null)
             arguments += $"metric={metric} ";
 
-        Process.Start(new ProcessStartInfo("netsh.exe", arguments)
+        using var process = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "netsh.exe"), arguments)
         {
             UseShellExecute = false,
-            Verb = "runas"
-        })!.WaitForExit();
+            CreateNoWindow = true
+        }) ?? throw new MessageException("无法启动网卡设置工具。");
+        if (!process.WaitForExit(15000)) { process.Kill(); throw new MessageException("设置网卡优先级超时。"); }
+        if (process.ExitCode != 0) throw new MessageException("设置网卡优先级失败。");
     }
 }
 

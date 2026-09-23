@@ -1,13 +1,15 @@
 ﻿using Microsoft.VisualStudio.Threading;
 using System.Net;
 using System.Text;
+using System.Net.Sockets;
+using Netch.Services.Dns;
+using Netch.Models;
 
 namespace Netch.Utils;
 
 public static class WebUtil
 {
     public const string DefaultUserAgent = @"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36 Edg/94.0.992.31";
-    private static readonly HttpClient _httpClient = CreateHttpClient();
 
 
     static WebUtil()
@@ -20,15 +22,33 @@ public static class WebUtil
 
     public static HttpClient CreateHttpClient(int? timeout = null, string? userAgent = null, string? proxyServer = null)
     {
-        var handler = new HttpClientHandler
+        var strict = DnsRuntime.Strict;
+        var handler = new SocketsHttpHandler
         {
             // 自动解压（以前 WebRequest 默认没开）
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-            UseProxy = !string.IsNullOrWhiteSpace(proxyServer),
-            Proxy = !string.IsNullOrEmpty(proxyServer) ? new WebProxy(proxyServer) : null
+            UseProxy = !strict && !string.IsNullOrWhiteSpace(proxyServer),
+            Proxy = !strict && !string.IsNullOrEmpty(proxyServer) ? new WebProxy(proxyServer) : null,
+            SslOptions = new System.Net.Security.SslClientAuthenticationOptions { CertificateChainPolicy = RemoteDnsTransport.OfflineCertificatePolicy() },
+            ConnectCallback = async (context, cancellation) =>
+            {
+                if (DnsRuntime.Strict)
+                {
+                    if (!strict || !DnsRuntime.TransportReady)
+                        throw new MessageException("本地解析已关闭，请先连接代理后重试下载或订阅更新。");
+                    return await SocksConnector.ConnectAsync(DnsRuntime.TransportPort, context.DnsEndPoint.Host, context.DnsEndPoint.Port, cancellation);
+                }
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+                try
+                {
+                    await socket.ConnectAsync(context.DnsEndPoint, cancellation);
+                    return new NetworkStream(socket, true);
+                }
+                catch { socket.Dispose(); throw; }
+            }
         };
 
-        var client = new HttpClient(handler)
+        var client = new HttpClient(new PolicyHandler(strict) { InnerHandler = handler })
         {
             Timeout = TimeSpan.FromMilliseconds(timeout ?? DefaultGetTimeout)
         };
@@ -41,9 +61,20 @@ public static class WebUtil
         return client;
     }
 
+    private sealed class PolicyHandler(bool strictAtCreation) : DelegatingHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (DnsRuntime.Strict && (!strictAtCreation || !DnsRuntime.TransportReady))
+                throw new MessageException("远程连接尚未就绪，本地解析已关闭。请连接代理后重试。");
+            return base.SendAsync(request, cancellationToken);
+        }
+    }
+
     public static async Task<byte[]> DownloadBytesAsync(string address)
     {
-        using var response = await _httpClient.GetAsync(address);
+        using var client = CreateHttpClient();
+        using var response = await client.GetAsync(address);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadAsByteArrayAsync();
     }
@@ -52,7 +83,7 @@ public static class WebUtil
     {
         encoding ??= Encoding.UTF8;
         // 判断是否需要创建临时客户端
-        bool needsTempClient = !string.IsNullOrWhiteSpace(proxyServer) || !string.IsNullOrWhiteSpace(userAgent);
+        bool needsTempClient = true;
 
         HttpClient httpClient;
 
@@ -63,7 +94,7 @@ public static class WebUtil
         else
         {
             // 都不需要时，使用全局实例
-            httpClient = _httpClient;
+            httpClient = CreateHttpClient();
         }
         try
         {
@@ -86,8 +117,8 @@ public static class WebUtil
 
     public static async Task DownloadFileAsync(string address, string fileFullPath, IProgress<int>? progress, int? timeout = null, string? proxyServer = null)
     {
-        var needsTempClient = timeout.HasValue || !string.IsNullOrWhiteSpace(proxyServer);
-        var httpClient = needsTempClient ? CreateHttpClient(timeout, proxyServer: proxyServer) : _httpClient;
+        var needsTempClient = true;
+        var httpClient = CreateHttpClient(timeout, proxyServer: proxyServer);
         try
         {
             using var response = await httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, address), HttpCompletionOption.ResponseHeadersRead);

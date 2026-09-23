@@ -4,6 +4,9 @@ using Netch.Models;
 using Netch.Models.Modes;
 using Netch.Servers;
 using Netch.Services;
+using Netch.Services.Dns;
+using Netch.Enums;
+using Netch.Models.Modes.TunMode;
 using Netch.Utils;
 using System.Diagnostics;
 
@@ -29,20 +32,34 @@ public static class MainController
 
         Log.Information("Start MainController: {Server} {Mode}", $"{server.ConfigType}", mode == null ? "Null" : $"[{(int)mode.Type}]{mode.i18NRemark}");
 
-        if (!server.IsComplexType() && await DnsUtils.LookupAsync(server.Address) == null)
-            throw new MessageException(i18N.Translate("Lookup Server hostname failed"));
-
-        // TODO Disable NAT Type Test setting
-        // cache STUN Server ip to prevent "Wrong STUN Server"
-        DnsUtils.LookupAsync(Global.Settings.STUN_Server).Forget();
+        await StopLockedAsync();
 
         Server = server;
         Mode = mode;
 
-        await Task.WhenAll(Task.Run(NativeMethods.RefreshDNSCache), Task.Run(Firewall.AddNetchFwRules));
-
+        var stage = "准备 DNS 服务";
+        void Phase(string name) => stage = name;
         try
         {
+            if (!DnsRuntime.Strict && DnsRuntime.Protection.Active)
+                throw new MessageException("DNS 保护仍在生效。切换到允许本地解析前，请先使用“停止并恢复系统 DNS”。");
+            DnsRuntime.Ipv4Only = mode is TunMode;
+            Phase(stage);
+            await DnsRuntime.PrepareAsync();
+            if (DnsRuntime.Strict)
+            {
+                Phase("检查节点配置");
+                // Validate every leaf and routing dependency before changing system DNS.
+                // Strict config generation uses only literal IPs or explicit mappings.
+                if (server.ConfigType is EConfigType.TUIC or EConfigType.Anytls)
+                    _ = await SingboxConfigUtils.GenerateClientConfigAsync(server);
+                else
+                    _ = await V2rayConfigUtils.GenerateClientConfigAsync(server);
+                Phase("建立 DNS 防护");
+                await DnsRuntime.Protection.EnableAsync(mode is TunMode);
+            }
+            Phase("初始化网络");
+            await Task.WhenAll(Task.Run(NativeMethods.RefreshDNSCache), Task.Run(Firewall.AddNetchFwRules));
             if (mode != null)
             {
                 ModeController = ModeService.GetModeControllerByType(mode.Type, out var modePort, out var portName);
@@ -64,11 +81,23 @@ public static class MainController
             // Start Server Controller to get a local socks5 server
             Log.Debug("Server Information: {Data}", $"{server.ConfigType} {server.MaskedData()}");
 
-            ServerController = new V2rayController();
+            ServerController = server.ConfigType is EConfigType.TUIC or EConfigType.Anytls
+                ? new SingboxController() : new V2rayController();
+            if (ServerController is Guard guard)
+            {
+                guard.Instance.EnableRaisingEvents = true;
+                guard.Instance.Exited += (_, _) =>
+                {
+                    if (ReferenceEquals(ServerController, guard)) DnsRuntime.Suspend();
+                };
+            }
             Global.MainForm.StatusText(i18N.TranslateFormat("Starting {0}", ServerController.Name));
 
             TryReleaseTcpPort(ServerController.Socks5LocalPort(), "Socks5");
+            Phase("启动代理核心");
             Socks5Server = await ServerController.StartAsync(server);
+            Phase("连接远程 DNS");
+            await DnsRuntime.ReadyAsync();
 
             StatusPortInfoText.Socks5Port = (ushort)Socks5Server.Port;
             StatusPortInfoText.UpdateShareLan();
@@ -77,67 +106,91 @@ public static class MainController
             // Start Mode Controller
             if (mode != null)
             {
+                Phase("启动代理模式");
                 Global.MainForm.StatusText(i18N.TranslateFormat("Starting {0}", ModeController.Name));
                 await ModeController.StartAsync(Socks5Server, mode);
+                // Mode setup may change routes or filtering; recheck the final DNS path.
+                Phase("验证远程 DNS");
+                await DnsRuntime.Service!.ProbeAsync();
             }
         }
         catch (Exception e)
         {
-            releaser.Dispose();
-            await StopAsync();
+            Log.Error(e, "MainController startup failed during {Stage}", stage);
+            await RecordStartupFailureAsync(stage, e);
+            await StopLockedAsync();
 
             switch (e)
             {
                 case DllNotFoundException:
-                case FileNotFoundException:
                     throw new Exception(e.Message + "\n\n" + i18N.Translate("Missing File or runtime components"));
+                case FileNotFoundException missingFile:
+                    throw new MessageException(string.IsNullOrWhiteSpace(missingFile.FileName)
+                        ? "启动时系统资源访问失败。请查看 logging/application.log 中的完整错误。"
+                        : $"启动所需文件不存在：{missingFile.FileName}");
                 case MessageException:
                     throw;
                 default:
-                    Log.Error(e, "Unhandled Exception When Start MainController");
-                    Utils.Utils.Open(Constants.LogFile);
-                    throw new MessageException($"{i18N.Translate("Unhandled Exception")}\n{e.Message}");
+                    throw new MessageException($"启动失败：{stage}（0x{e.HResult:X8}）。\n{e.Message}\n\n详细信息见 data/startup-error.log。");
             }
         }
     }
 
     public static async Task StopAsync()
     {
-        if (Lock.CurrentCount == 0)
-        {
-            (await Lock.EnterAsync()).Dispose();
-            if (ServerController == null && ModeController == null)
-                // stopped
-                return;
-
-            // else begin stop
-        }
-
         using var _ = await Lock.EnterAsync();
+        await StopLockedAsync();
+    }
+
+    private static async Task RecordStartupFailureAsync(string stage, Exception exception)
+    {
+        try
+        {
+            // The legacy launcher clears logging/ on every start. Keep the most recent
+            // startup failure in data/ so restarting or reverting does not erase it.
+            Directory.CreateDirectory(Configuration.DataDirectoryFullName);
+            await File.WriteAllTextAsync(Path.Combine(Configuration.DataDirectoryFullName, "startup-error.log"),
+                $"{DateTimeOffset.Now:O} Netch {UpdateChecker.Version}\n阶段：{stage}\n{exception}\n");
+        }
+        catch (Exception logError) { Log.Warning(logError, "Could not preserve startup failure details"); }
+    }
+
+    public static async Task RestoreDnsAsync()
+    {
+        using var _ = await Lock.EnterAsync();
+        await StopLockedAsync();
+        await DnsRuntime.Protection.RestoreAsync();
+        await DnsRuntime.DisposeServiceAsync();
+        DnsRuntime.Report("已恢复系统 DNS，DNS 保护已解除。");
+    }
+
+    private static async Task StopLockedAsync()
+    {
+        DnsRuntime.Suspend();
 
         if (ServerController == null && ModeController == null)
             return;
 
         Log.Information("Stop Main Controller");
         StatusPortInfoText.Reset();
-
-        var tasks = new[]
-        {
-            ServerController?.StopAsync() ?? Task.CompletedTask,
-            ModeController?.StopAsync() ?? Task.CompletedTask
-        };
+        var stopErrors = new List<string>();
 
         try
         {
-            await Task.WhenAll(tasks);
+            if (ModeController != null) await ModeController.StopAsync();
+            ModeController = null;
         }
+
         catch (Exception e)
         {
             Log.Error(e, "MainController Stop Error");
+            stopErrors.Add(e.Message);
         }
 
-        ServerController = null;
-        ModeController = null;
+        try { if (ServerController != null) await ServerController.StopAsync(); ServerController = null; }
+        catch (Exception e) { Log.Error(e, "Server controller stop failed"); stopErrors.Add(e.Message); }
+        Socks5Server = null;
+        if (stopErrors.Count > 0) throw new MessageException("停止未完成，DNS 保护保持。请重试停止或恢复：" + string.Join("；", stopErrors));
     }
 
     public static void PortCheck(ushort port, string portName, PortType portType = PortType.Both)
@@ -158,42 +211,7 @@ public static class MainController
 
     public static void TryReleaseTcpPort(ushort port, string portName)
     {
-        foreach (var p in PortHelper.GetProcessByUsedTcpPort(port))
-        {
-            var fileName = p.MainModule?.FileName;
-            if (fileName == null)
-                continue;
-
-            if (fileName.StartsWith(Global.NetchDir))
-            {
-                p.Kill();
-                p.WaitForExit();
-            }
-            else
-            {
-                throw new MessageException(i18N.TranslateFormat("The {0} port is used by {1}.", $"{portName} ({port})", $"({p.Id}){fileName}"));
-            }
-
-            //var pids = GetPidByUdpPort(port);
-            //foreach (var pid in pids)
-            //{
-            //    try
-            //    {
-            //        var process = Process.GetProcessById(pid);
-
-            //        Log.Verbose($"Killing PID {pid} ({process.ProcessName})");
-
-            //        process.Kill();
-            //        process.WaitForExit();
-            //    }
-            //    catch (Exception ex)
-            //    {
-            //        Log.Verbose($"Failed to kill PID {pid}: {ex.Message}");
-            //    }
-            //}
-
-        }
-
+        // A port conflict must never terminate another application or this DNS listener.
         PortCheck(port, portName, PortType.TCP);
     }
 

@@ -5,6 +5,7 @@ using Netch.Models.Modes;
 using Netch.Models.Modes.TunMode;
 using Netch.Servers;
 using Netch.Utils;
+using Netch.Services.Dns;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -13,10 +14,9 @@ namespace Netch.Controllers
 {
     public class TUNController : IModeController
     {
-        private readonly DNSController _aioDnsController = new();
+        private readonly List<NetRoute> _ownedRoutes = [];
 
         private TunMode _mode = new();
-        private IPAddress? _serverRemoteAddress;
         private TUNConfig _tunConfig = new();
 
         private NetRoute _tun;
@@ -35,16 +35,9 @@ namespace Netch.Controllers
             _mode = tunMode;
             _tunConfig = Global.Settings.TUNTAP;
 
-            ArgumentException.ThrowIfNullOrEmpty(server.RemoteHostname);
-
-            _serverRemoteAddress = server.RemoteHostname.ValueOrDefault() != null
-                ? await DnsUtils.LookupAsync(server.RemoteHostname)
-                : await DnsUtils.LookupAsync(server.Address);
-
-            if (_serverRemoteAddress != null && IPAddress.IsLoopback(_serverRemoteAddress)) _serverRemoteAddress = null;
-
             _outbound = NetRoute.GetBestRouteTemplate();
-            CheckDriver();
+            if (!File.Exists(Path.Combine(Global.NetchDir, Constants.WintunDllFile)))
+                throw new MessageException("缺少 bin 中的 wintun.dll。");
 
             // 组装 tun2socks 参数
             string proxyHost = await server.AutoResolveHostnameAsync();
@@ -78,47 +71,17 @@ namespace Netch.Controllers
 
             _tun = NetRoute.TemplateBuilder(_tunConfig.Gateway, tunIndex);
 
-            RouteHelper.CreateUnicastIP(AddressFamily.InterNetwork, _tunConfig.Address, (byte)Utils.Utils.SubnetToCidr(_tunConfig.Netmask), (ulong)tunIndex);
+            if (!RouteHelper.CreateUnicastIP(AddressFamily.InterNetwork, _tunConfig.Address, (byte)Utils.Utils.SubnetToCidr(_tunConfig.Netmask), (ulong)tunIndex))
+                throw new MessageException("无法配置 TUN 地址，已停止启动。");
 
             SetupRouteTable();
+            await DnsProtectionController.SetDnsAsync(tunIndex, false, ["127.0.0.1"]);
         }
 
         public async Task StopAsync()
         {
-            var tasks = new[]
-            {
-                //杀掉进程
-                TUN2Socks.FreeAsync(),
-                //清理路由
-                Task.Run(ClearRouteTable),
-                _aioDnsController.StopAsync()
-            };
-
-            await Task.WhenAll(tasks);
-        }
-
-        private async void CheckDriver()
-        {
-            string binDriver = Path.Combine(Global.NetchDir, Constants.WintunDllFile);
-            string sysDriver = $@"{Environment.SystemDirectory}\wintun.dll";
-
-            var binHash = await Utils.Utils.Sha256CheckSumAsync(binDriver);
-            var sysHash = await Utils.Utils.Sha256CheckSumAsync(sysDriver);
-            Log.Information("Built-in  wintun.dll Hash: {Hash}", binHash);
-            Log.Information("Installed wintun.dll Hash: {Hash}", sysHash);
-            if (binHash == sysHash)
-                return;
-
-            try
-            {
-                Log.Information("Copy wintun.dll to System Directory");
-                File.Copy(binDriver, sysDriver, true);
-            }
-            catch (Exception e)
-            {
-                Log.Error(e, "Copy wintun.dll failed");
-                throw new MessageException($"Failed to copy wintun.dll to system directory: {e.Message}");
-            }
+            await Task.Run(ClearRouteTable);
+            if (!await TUN2Socks.FreeAsync()) throw new MessageException("tun2socks 停止失败。");
         }
 
         #region Route
@@ -127,55 +90,42 @@ namespace Netch.Controllers
         {
             //UI 层显示状态：“正在设置路由规则”
             Global.MainForm.StatusText(i18N.Translate("Setup Route Table Rule"));
-            //获取当前 TUN 网卡对象，用于后续操作（比如设置 DNS）
-            var tunNetworkInterface = NetworkInterfaceUtils.Get(_tun.InterfaceIndex);
-            // Server Address
-            if (_serverRemoteAddress != null)
-                RouteUtils.CreateRoute(_outbound.FillTemplate(_serverRemoteAddress.ToString(), 32));
+            foreach (var address in DnsRuntime.ConnectionAddresses.Where(a => !IPAddress.IsLoopback(a)))
+                AddRoute(_outbound.FillTemplate(address.ToString(), 32));
 
             // Global Bypass IPs
-            RouteUtils.CreateRouteFill(_outbound, _tunConfig.BypassIPs);
+            AddRoutes(_outbound, _tunConfig.BypassIPs);
 
             // rule
-            RouteUtils.CreateRouteFill(_tun, _mode.Handle);
-            RouteUtils.CreateRouteFill(_outbound, _mode.Bypass);
-
-            // dns
-
-            if (_tunConfig.UseCustomDNS)
-            {
-                if (_tunConfig.ProxyDNS)
-                {
-                    // NOTICE: DNS metric is network interface metric
-                    RouteUtils.CreateRoute(_tun.FillTemplate(_tunConfig.DNS, 32));
-                }
-
-                tunNetworkInterface.SetDns(_tunConfig.DNS);
-
-            }
-            else
-            {
-                RouteUtils.CreateRoute(_outbound.FillTemplate(Utils.Utils.GetHostFromUri(Global.Settings.AioDNS.ChinaDNS), 32));
-                RouteUtils.CreateRoute(_tun.FillTemplate(Utils.Utils.GetHostFromUri(Global.Settings.AioDNS.OtherDNS), 32));
-            }
+            AddRoutes(_tun, _mode.Handle);
+            AddRoutes(_outbound, _mode.Bypass);
 
             NetworkInterfaceUtils.SetInterfaceMetric(_tun.InterfaceIndex, 0);
         }
 
         private void ClearRouteTable()
         {
-            if (_serverRemoteAddress != null)
-                RouteUtils.DeleteRoute(_outbound.FillTemplate(_serverRemoteAddress.ToString(), 32));
+            foreach (var route in _ownedRoutes.AsEnumerable().Reverse())
+                if (!RouteUtils.DeleteRoute(route)) Log.Warning("Could not remove Netch route {Network}", route.Network);
+            _ownedRoutes.Clear();
+        }
 
-            if (_outbound.Gateway != null)
+        private void AddRoute(NetRoute route)
+        {
+            if (_ownedRoutes.Any(r => r.Network == route.Network && r.Cidr == route.Cidr && r.InterfaceIndex == route.InterfaceIndex)) return;
+            if (!RouteUtils.CreateRoute(route)) throw new MessageException($"路由创建失败：{route.Network}/{route.Cidr}，已停止启动。");
+            _ownedRoutes.Add(route);
+        }
+
+        private void AddRoutes(NetRoute template, IEnumerable<string> rules)
+        {
+            foreach (var rule in rules)
             {
-                RouteUtils.DeleteRouteFill(_outbound, Global.Settings.TUNTAP.BypassIPs);
-                RouteUtils.DeleteRoute(_outbound.FillTemplate(Utils.Utils.GetHostFromUri(Global.Settings.AioDNS.ChinaDNS), 32));
-                NetworkInterfaceUtils.SetInterfaceMetric(_outbound.InterfaceIndex);
+                if (!RouteUtils.TryParseIPNetwork(rule, out var network, out var cidr) || cidr is < 0 or > 32 ||
+                    !IPAddress.TryParse(network, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork)
+                    throw new MessageException($"无效的 IPv4 路由：{rule}");
+                AddRoute(template.FillTemplate(network, (byte)cidr));
             }
-
-            if (_mode != null)
-                RouteUtils.DeleteRouteFill(_outbound, _mode.Bypass);
         }
 
         #endregion

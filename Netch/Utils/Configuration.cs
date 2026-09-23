@@ -46,19 +46,6 @@ public static class Configuration
 
             if (await LoadCoreAsync(FileFullName))
             {
-                if (Global.Settings.Server.Count == 0 &&
-                    File.Exists(BackupFileFullName) &&
-                    await TryLoadSettingsAsync(BackupFileFullName) is { Server.Count: > 0 } backupSettings)
-                {
-                    CheckSetting(backupSettings);
-                    Global.Settings = backupSettings;
-                    Log.Warning(
-                        "Configuration \"{FileName}\" has no servers; restored {ServerCount} server(s) from backup \"{BackupFileName}\".",
-                        FileFullName,
-                        backupSettings.Server.Count,
-                        BackupFileFullName);
-                }
-
                 return;
             }
 
@@ -116,6 +103,9 @@ public static class Configuration
         settings.Server ??= new();
         settings.RoutingProfiles ??= new();
         settings.Profiles ??= new();
+        settings.DnsPolicy ??= new();
+        settings.DnsPolicy.LocalDomainRules ??= [];
+        settings.DnsPolicy.BootstrapMappings ??= new(StringComparer.OrdinalIgnoreCase);
 
         foreach (var server in settings.Server.Where(server => server.Id.IsNullOrWhiteSpace()))
         {
@@ -165,18 +155,6 @@ public static class Configuration
 
             if (!Directory.Exists(DataDirectoryFullName))
                 Directory.CreateDirectory(DataDirectoryFullName);
-
-            if (Global.Settings.Server.Count == 0 && await ExistingConfigurationHasServersAsync())
-            {
-                Log.Error(
-                    "Refused to save configuration with 0 servers because existing configuration contains servers. This prevents accidental data loss.");
-                MessageBox.Show(
-                    "Refused to save empty server configuration because the existing configuration contains servers.\nPlease back up data\\settings.json and restart Netch.",
-                    "Netch",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-                return;
-            }
 
             var tempFile = Path.Combine(DataDirectoryFullName, FileFullName + ".tmp");
             await using (var fileStream = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None, 4096, true))

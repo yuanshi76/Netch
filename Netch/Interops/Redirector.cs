@@ -43,14 +43,38 @@ public static class Redirector
         return aio_dial(name, value);
     }
 
-    public static Task<bool> InitAsync()
+    private static readonly SemaphoreSlim LifecycleGate = new(1);
+    private static bool _cleanupRequired;
+
+    public static async Task<bool> InitAsync()
     {
-        return Task.Run(aio_init);
+        await LifecycleGate.WaitAsync();
+        try
+        {
+            if (_cleanupRequired) throw new InvalidOperationException("Redirector is already initialized.");
+            var success = await Task.Run(aio_init);
+            // aio_init acquires Winsock before initializing its handlers/driver. Even
+            // a reported initialization failure can therefore need paired cleanup.
+            // DLL load/entry-point failures never acquire native resources.
+            _cleanupRequired = true;
+            return success;
+        }
+        finally { LifecycleGate.Release(); }
     }
 
-    public static Task<bool> FreeAsync()
+    public static async Task FreeAsync()
     {
-        return Task.Run(aio_free);
+        await LifecycleGate.WaitAsync();
+        try
+        {
+            // A controller may exist before remote DNS startup succeeds. Calling
+            // aio_free without aio_init steals .NET's Winsock reference, cancels
+            // every pending socket (995), and breaks subsequent sockets (10093).
+            if (!_cleanupRequired) return;
+            await Task.Run(aio_free);
+            _cleanupRequired = false;
+        }
+        finally { LifecycleGate.Release(); }
     }
 
     private const string Redirector_bin = "Redirector.bin";
@@ -68,7 +92,7 @@ public static class Redirector
     private static extern bool aio_init();
 
     [DllImport(Redirector_bin, CallingConvention = CallingConvention.Cdecl)]
-    private static extern bool aio_free();
+    private static extern void aio_free();
 
     [DllImport(Redirector_bin, CallingConvention = CallingConvention.Cdecl)]
     private static extern ulong aio_getUP();

@@ -7,6 +7,8 @@ namespace Netch.Models;
 /// </summary>
 public class Setting
 {
+    public DnsPolicyConfig DnsPolicy { get; set; } = new();
+
     /// <summary>
     /// Outbound解析用的DNS服务器地址
     /// </summary>

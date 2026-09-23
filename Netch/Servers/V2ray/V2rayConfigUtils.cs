@@ -2,6 +2,7 @@
 using Netch.Manager;
 using Netch.Models;
 using Netch.Utils;
+using Netch.Services.Dns;
 
 #pragma warning disable VSTHRD200
 
@@ -27,32 +28,36 @@ public static class V2rayConfigUtils
             loglevel = server.IsComplexType() ? Constants.LogLevels[0] : Constants.LogLevels[2]
         };
 
-        if (!Utils.Utils.IsIp(server.Address) && 
-            Global.Settings.OutboundDNS_Enabled && 
-            Global.Settings.OutboundDNS_UseDomainName && 
-            !Global.Settings.OutboundDNS.ToLowerInvariant().StartsWith("tls://"))
+        // The only core resolver is the local policy broker. It never performs system fallback.
+        v2rayConfig.dns = new
         {
-
-            v2rayConfig.dns = new Dns4Ray()
-            {
-                servers = [
-                    new DnsServer4Ray
-                    {
-                        address = Global.Settings.OutboundDNS,
-                        domains = [$"domain:{server.Address}"],
-                        skipFallback = true
-                    }
-                ]
-
-            };
-
-
-        }
-
-        v2rayConfig.inbounds = [GenerateInbound()];
+            servers = new[] { new { address = "tcp+local://127.0.0.1:53", domains = new[] { "regexp:.*" }, skipFallback = true } },
+            disableCache = true, disableFallback = true
+        };
+        v2rayConfig.inbounds = [GenerateInbound(), new Inbounds4Ray
+        {
+            tag = RemoteDnsService.TransportTag, protocol = "socks", listen = "127.0.0.1",
+            port = DnsRuntime.TransportPort, settings = new Inboundsettings4Ray { auth = "noauth", udp = false }
+        }];
 
         v2rayConfig.outbounds = await BuildAllProxyOutbounds(server, ProxyTag, []);
         v2rayConfig.routing = await GenerateRoutingAsync(v2rayConfig, server);
+
+        v2rayConfig.routing ??= new Routing4Ray { domainStrategy = "AsIs", rules = [] };
+        var dnsRoute = new RulesItem4Ray { type = "field", inboundTag = [RemoteDnsService.TransportTag] };
+        if (server.ConfigType == EConfigType.PolicyGroup)
+        {
+            v2rayConfig.routing.balancers ??= [];
+            dnsRoute.balancerTag = EnsureBalancer(v2rayConfig, v2rayConfig.routing.balancers, ProxyTag);
+        }
+        else dnsRoute.outboundTag = ProxyTag;
+        v2rayConfig.routing.rules.Insert(0, dnsRoute);
+        if (v2rayConfig.routing.balancers is { Count: > 0 })
+            v2rayConfig.observatory = new Observatory4Ray
+            {
+                subjectSelector = v2rayConfig.routing.balancers.SelectMany(b => b.selector ?? []).Distinct().ToList(),
+                probeUrl = "https://www.gstatic.com/generate_204", probeInterval = "60s", enableConcurrency = true
+            };
 
 
         return v2rayConfig;
@@ -404,6 +409,7 @@ public static class V2rayConfigUtils
         balancers.Add(new BalancersItem4Ray
         {
             tag = balancerTag,
+            fallbackTag = selector.FirstOrDefault(),
             selector = selector,
             strategy = new BalancersStrategy4Ray
             {
@@ -420,7 +426,7 @@ public static class V2rayConfigUtils
         {
             tag = DirectTag,
             protocol = "freedom",
-            settings = new Outboundsettings4Ray()
+            settings = new Outboundsettings4Ray { domainStrategy = "ForceIP" }
         };
     }
 
@@ -463,14 +469,11 @@ public static class V2rayConfigUtils
             settings = new Outboundsettings4Ray(),
         };
 
-        var ipAddress = server.Address;
-
-        if (Global.Settings.OutboundDNS_Enabled)
-        {
-            if (!Global.Settings.OutboundDNS_UseDomainName ||
-                (Global.Settings.OutboundDNS_UseDomainName && Global.Settings.OutboundDNS.ToLowerInvariant().StartsWith("tls://")))
-                ipAddress = (await DnsUtils.LookupAsync(server.Address)).ToString();
-        }
+        if (server.ConfigType is EConfigType.TUIC or EConfigType.Anytls)
+            throw new MessageException("TUIC / AnyTLS 请作为单独节点使用；当前 Xray 代理链不支持混入这些协议。");
+        if (DnsRuntime.Strict && new[] { 53, 853, 5353, 5355, 137 }.Contains(server.Port))
+            throw new MessageException("节点端口与严格 DNS 阻断端口冲突，请使用其他代理端口。");
+        var ipAddress = await DnsRuntime.ConnectionAddressAsync(server.Address);
         var muxEnabled = server.MuxEnabled ?? Global.Settings.V2RayConfig.CoreBasicItem.MuxEnabled;
         GenOutboundMux(outbound);
         switch (server)
@@ -592,7 +595,7 @@ public static class V2rayConfigUtils
                 break;
             case WireGuardServer wg:
                 outbound.protocol = "wireguard";
-                var address = wg.Address;
+                var address = ipAddress;
                 if (Utils.Utils.IsIpv6(address))
                 {
                     address = $"[{address}]";
@@ -634,6 +637,8 @@ public static class V2rayConfigUtils
             }
             streamSettings.network = network;
             var host = server.RequestHost.TrimEx();
+            if (string.IsNullOrWhiteSpace(host) && network is "ws" or "httpupgrade" or "xhttp" or "h2" or "grpc")
+                host = server.Address;
             var path = server.Path.TrimEx();
             var sni = server.Sni.TrimEx();
             var useragent = "";
@@ -670,6 +675,7 @@ public static class V2rayConfigUtils
                 {
                     tlsSettings.serverName = Utils.Utils.String2List(host)?.First();
                 }
+                else tlsSettings.serverName = server.Address;
                 var certs = CertPemManager.ParsePemChain(server.Cert);
                 if (certs.Count > 0)
                 {

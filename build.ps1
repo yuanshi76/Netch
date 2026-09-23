@@ -24,13 +24,17 @@ param (
 
 Push-Location (Split-Path $MyInvocation.MyCommand.Path -Parent)
 
-if ( Test-Path -Path $OutputPath ) {
-    rm -Recurse -Force $OutputPath
+$ErrorActionPreference = 'Stop'
+$taskBuildRoot = [IO.Path]::GetFullPath($PWD.Path).TrimEnd('\')
+$taskOutput = [IO.Path]::GetFullPath((Join-Path $taskBuildRoot $OutputPath))
+if (-not $taskOutput.StartsWith($taskBuildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'OutputPath must be a child directory inside this project.'
 }
-New-Item -ItemType Directory -Name $OutputPath | Out-Null
+# Preserve existing directories; building must never delete an arbitrary output tree.
+New-Item -ItemType Directory -Path $taskOutput -Force | Out-Null
 
 Push-Location $OutputPath
-New-Item -ItemType Directory -Name 'bin'  | Out-Null
+New-Item -ItemType Directory -Name 'bin' -Force | Out-Null
 cp -Recurse -Force '..\Storage\i18n' '.'  | Out-Null
 cp -Recurse -Force '..\Storage\mode' '.'  | Out-Null
 cp -Recurse -Force '..\Storage\stun.txt' 'bin'  | Out-Null
@@ -52,7 +56,7 @@ cp -Force '.\Other\release\*.dll' "$OutputPath\bin"
 cp -Force '.\Other\release\*.exe' "$OutputPath\bin"
 cp -Force '.\Other\release\GeoLite2-Country.mmdb' "$OutputPath\bin"
 
-if ( -Not ( Test-Path ".\Netch\bin\$Configuration" ) ) {
+& {
 	Write-Host
 	Write-Host 'Building Netch'
 
@@ -61,7 +65,7 @@ if ( -Not ( Test-Path ".\Netch\bin\$Configuration" ) ) {
 		-r 'win-x64' `
 		-p:Platform='x64' `
 		-p:SelfContained=$SelfContained `
-		-p:PublishTrimmed=$PublishReadyToRun `
+		-p:PublishTrimmed=$False `
 		-p:PublishSingleFile=$PublishSingleFile `
 		-p:PublishReadyToRun=$PublishReadyToRun `
 		-p:PublishReadyToRunShowWarnings=$PublishReadyToRun `
@@ -72,7 +76,7 @@ if ( -Not ( Test-Path ".\Netch\bin\$Configuration" ) ) {
 }
 cp -Force ".\Netch\bin\$Configuration\Netch.exe" $OutputPath
 
-if ( -Not ( Test-Path ".\Redirector\bin\$Configuration" ) ) {
+& {
 	Write-Host
 	Write-Host 'Building Redirector'
 
@@ -85,7 +89,7 @@ if ( -Not ( Test-Path ".\Redirector\bin\$Configuration" ) ) {
 cp -Force ".\Redirector\bin\$Configuration\nfapi.dll"      "$OutputPath\bin"
 cp -Force ".\Redirector\bin\$Configuration\Redirector.bin" "$OutputPath\bin"
 
-if ( -Not ( Test-Path ".\RouteHelper\bin\$Configuration" ) ) {
+& {
 	Write-Host
 	Write-Host 'Building RouteHelper'
 
@@ -98,8 +102,8 @@ if ( -Not ( Test-Path ".\RouteHelper\bin\$Configuration" ) ) {
 cp -Force ".\RouteHelper\bin\$Configuration\RouteHelper.bin" "$OutputPath\bin"
 
 if ( $Configuration.Equals('Release') ) {
-	rm -Force "$OutputPath\*.pdb"
-	rm -Force "$OutputPath\*.xml"
+	Get-ChildItem -LiteralPath $taskOutput -Filter '*.pdb' | Remove-Item -Force
+	Get-ChildItem -LiteralPath $taskOutput -Filter '*.xml' | Remove-Item -Force
 }
 
 Pop-Location

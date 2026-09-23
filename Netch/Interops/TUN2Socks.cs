@@ -8,6 +8,7 @@ namespace Netch.Interops
     public static class TUN2Socks
     {
         private static Process? _process;
+        private static Task _outputTask = Task.CompletedTask;
 
         public static bool Init(string interfaceName, string proxyHost, int proxyPort, string? username = null, string? password = null)
         {
@@ -21,7 +22,6 @@ namespace Netch.Interops
             try
             {
                 var args = BuildArgs(interfaceName, proxyHost, proxyPort, username, password);
-                Log.Verbose($"[tun2socks] Args: {args}");
                 var processPath = Path.Combine(Global.NetchDir, Constants.TUN2SocksFile);
                 Log.Verbose($"[tun2socks] Path: {processPath}");
 
@@ -32,7 +32,8 @@ namespace Netch.Interops
                     RedirectStandardOutput = true,
                     RedirectStandardInput = true,
                     UseShellExecute = false,
-                    CreateNoWindow = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(processPath),
                     StandardErrorEncoding = Encoding.UTF8,
                     StandardInputEncoding = Encoding.UTF8,
                     StandardOutputEncoding = Encoding.UTF8
@@ -43,6 +44,10 @@ namespace Netch.Interops
                     StartInfo = info,
                     EnableRaisingEvents = true
                 };
+                _process.Exited += (sender, _) =>
+                {
+                    if (ReferenceEquals(sender, _process)) Netch.Services.Dns.DnsRuntime.Suspend();
+                };
 
                 if (_process.Start())
                 {
@@ -51,6 +56,7 @@ namespace Netch.Interops
                 else
                 {
                     Log.Error("[tun2socks] 启动失败。");
+                    return false;
                 }
 
                 _process.StandardInput.AutoFlush = true;
@@ -58,7 +64,7 @@ namespace Netch.Interops
                 Global.Job.AddProcess(_process);
 
                 // 可选：异步读取输出
-                _ = Task.Run(async () => ReadOutputAsync(_process));
+                _outputTask = ReadOutputAsync(_process);
 
                 return true;
             }
@@ -76,7 +82,7 @@ namespace Netch.Interops
         /// <returns></returns>
         public static async Task<bool> FreeAsync()
         {
-            bool isSuccess;
+            bool isSuccess = true;
             try
             {
                 if (_process != null && !_process.HasExited)
@@ -94,10 +100,12 @@ namespace Netch.Interops
             }
             finally
             {
-                // 释放进程资源
-                _process?.Dispose();
-                _process = null;
-                isSuccess = true;
+                if (isSuccess)
+                {
+                    try { await _outputTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch (Exception ex) { Log.Warning(ex, "tun2socks output cleanup failed"); }
+                    _process?.Dispose();
+                    _process = null;
+                }
             }
             return isSuccess;
         }
@@ -156,8 +164,7 @@ namespace Netch.Interops
         private const string interfaceGUID = "{20214AD5-1D95-4CC1-9233-D850D2C9CF9C}";
         private static string BuildArgs(string interfaceName, string host, int port, string? username, string? password)
         {
-            CleanRegeditNetworkProfiles(ProfilesKeyPath, "Description", interfaceName);
-            CleanRegeditNetworkProfiles(UnmanagedKeyPath, "Description", interfaceName);
+            // Network profile cleanup must not delete unrelated or user-owned profiles.
             var sb = new StringBuilder();
             //todo:使用GUID偶尔报 Failed to setup adapter (problem code: 0x1F, ntstatus: 0xC0000035): 当文件已存在时，无法创建该文件。 (Code 0x000000B7)
             //FATAL   engine/engine.go:45     [ENGINE] failed to start: create tun: Error creating interface: Cannot create a file when that file already exists.
@@ -167,7 +174,7 @@ namespace Netch.Interops
             sb.Append("-proxy socks5://");
             if (!string.IsNullOrEmpty(username))
             {
-                sb.Append($"{username}:{password}@");
+                sb.Append($"{Uri.EscapeDataString(username)}:{Uri.EscapeDataString(password ?? "")}@");
             }
             sb.Append($"{host}:{port} ");
 
@@ -183,6 +190,7 @@ namespace Netch.Interops
             string logPath = Path.Combine(Global.NetchDir, "logging", "tun2socks.log");
             await using var _logFileStream = new FileStream(logPath, FileMode.Create, FileAccess.Write, FileShare.Read, 4096, true);
             await using var _logStreamWriter = new StreamWriter(_logFileStream, Encoding.UTF8) { AutoFlush = true };
+            using var logLock = new SemaphoreSlim(1);
 
             Task ReadStreamAsync(StreamReader reader, Action<string> logAction)
             {
@@ -194,13 +202,14 @@ namespace Netch.Interops
                     {
                         while ((line = await reader.ReadLineAsync()) != null)
                         {
-                            await _logStreamWriter.WriteLineAsync($"[{prefix}] {line}");
+                            await logLock.WaitAsync();
+                            try { await _logStreamWriter.WriteLineAsync($"[{prefix}] {line}"); }
+                            finally { logLock.Release(); }
                             //logAction?.Invoke($"[{prefix}] {line}");
                         }
                     }
                     catch (Exception ex)
                     {
-                        await _logStreamWriter.WriteLineAsync($"[{prefix}] Stream read exception: {ex}");
                         Log.Error(ex.ToString());
                     }
                 });
@@ -212,8 +221,6 @@ namespace Netch.Interops
 
             await _logStreamWriter.WriteLineAsync("[tun2socks] Process exited.");
 
-            await _logStreamWriter.DisposeAsync();
-            await _logFileStream.DisposeAsync();
         }
 
         #region 注册表操作

@@ -1,116 +1,25 @@
-﻿using DnsClientX;
-using Microsoft.VisualStudio.Threading;
-using System.Collections;
 using System.Net;
 using System.Net.Sockets;
+using Netch.Services.Dns;
 
 namespace Netch.Utils;
 
 public static class DnsUtils
 {
-    private static readonly AsyncSemaphore Lock = new(1);
-
-    /// <summary>
-    ///     缓存
-    /// </summary>
-    private static readonly Hashtable Cache = new();
-    private static readonly Hashtable Cache6 = new();
-
     public static async Task<IPAddress?> LookupAsync(string hostname, AddressFamily inet = AddressFamily.Unspecified, int timeout = 3000, string? dns = null)
     {
-        using var _ = await Lock.EnterAsync();
-        if (IPAddress.TryParse(hostname, out var ip))
+        // All callers share the same policy; the obsolete per-call resolver cannot bypass it.
+        using var cancellation = new CancellationTokenSource(Math.Max(timeout, Global.Settings.DnsPolicy.QueryTimeoutMs));
+        try { return await DnsRuntime.LookupAsync(hostname, inet, cancellation.Token); }
+        catch (Exception ex)
         {
-            // AddressFamily 过滤
-            if (inet == AddressFamily.Unspecified || ip.AddressFamily == inet)
-                return ip;
-        }
-
-        try
-        {
-            var cacheResult = inet switch
-            {
-                AddressFamily.Unspecified => (IPAddress?)(Cache[hostname] ?? Cache6[hostname]),
-                AddressFamily.InterNetwork => (IPAddress?)Cache[hostname],
-                AddressFamily.InterNetworkV6 => (IPAddress?)Cache6[hostname],
-                _ => throw new ArgumentOutOfRangeException()
-            };
-
-            if (cacheResult != null)
-                return cacheResult;
-
-            return await LookupNoCacheAsync(hostname, inet, timeout, Global.Settings.OutboundDNS_Enabled ? NormalizeDnsUri(dns) : null);
-        }
-        catch (Exception e)
-        {
-            Log.Verbose(e, "Lookup hostname {Hostname} failed", hostname);
+            Log.Warning("DNS lookup failed: {Reason}", ex.Message);
+            DnsRuntime.Report(ex.Message);
             return null;
         }
     }
 
-    private static async Task<IPAddress?> LookupNoCacheAsync(string hostname, AddressFamily inet = AddressFamily.Unspecified, int timeout = 3000, Uri dnsUri = null)
-    {
-        IPAddress[] addresses;
-        var type = inet == AddressFamily.InterNetworkV6
-            ? DnsRecordType.AAAA
-            : DnsRecordType.A;
-        if (dnsUri == null)
-        {
-            // 使用系统配置的 DNS 服务器（示例，需根据实际情况调整）
-            var response = await ClientX.QueryDns(hostname, type, DnsEndpoint.System);
-            addresses = response.Answers.Select(a => IPAddress.Parse(a.Data)).ToArray();
-            //addresses = await Dns.GetHostAddressesAsync(hostname);
-        }
-        else
-        {
-            var scheme = dnsUri.Scheme;
-            using var client = scheme.ToLowerInvariant() switch
-            {
-                // 🔹 DNS over TLS
-                "tls" => new ClientXBuilder().WithBaseUri(dnsUri, DnsRequestFormat.DnsOverTLS).WithTimeout(timeout).Build(),
-
-                // 🔹 DNS over HTTPS
-                "https" => new ClientXBuilder()
-                    .WithBaseUri(dnsUri, DnsRequestFormat.DnsOverHttps).WithTimeout(timeout).Build(),
-
-                // 🔹 普通 UDP
-                _ => new ClientXBuilder()
-                    .WithBaseUri(dnsUri, DnsRequestFormat.DnsOverUDP).WithTimeout(timeout).Build()
-            };
-            var response = await client.Resolve(hostname, type);
-            addresses = response?.Answers?
-            .Where(a => IPAddress.TryParse(a.Data?.ToString(), out _))
-            .Select(a => IPAddress.Parse(a.Data.ToString()))
-            .ToArray()
-            ?? Array.Empty<IPAddress>();
-
-        }
-
-        var result = addresses.FirstOrDefault(i => inet == AddressFamily.Unspecified || i.AddressFamily == inet);
-
-        if (result == null) return null;
-
-        switch (result.AddressFamily)
-        {
-            case AddressFamily.InterNetwork:
-                Cache.Add(hostname, result);
-                break;
-            case AddressFamily.InterNetworkV6:
-                Cache6.Add(hostname, result);
-                break;
-            default:
-                throw new ArgumentOutOfRangeException();
-        }
-
-        return result;
-    }
-
-    public static void ClearCache()
-    {
-        Cache.Clear();
-        Cache6.Clear();
-    }
-
+    public static void ClearCache() => DnsRuntime.Service?.ClearCache();
     public static string AppendPort(string host, ushort port = 53)
     {
         if (!host.Contains(':'))

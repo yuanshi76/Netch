@@ -3,3 +3,7 @@
 /release
 /packages
 /TestResults
+/.build/
+/artifacts/
+**/obj/
+**/bin/
