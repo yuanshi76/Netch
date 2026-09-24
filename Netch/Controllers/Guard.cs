@@ -3,14 +3,14 @@ using System.Text;
 using Microsoft.VisualStudio.Threading;
 using Netch.Enums;
 using Netch.Models;
+using Netch.Services;
 using Netch.Utils;
 
 namespace Netch.Controllers;
 
 public abstract class Guard
 {
-    private FileStream? _logFileStream;
-    private StreamWriter? _logStreamWriter;
+    private CoreLogWriter? _logStreamWriter;
     private readonly SemaphoreSlim _logLock = new(1);
     private Task _outputTask = Task.CompletedTask;
     private bool _started;
@@ -23,7 +23,7 @@ public abstract class Guard
     {
         RedirectOutput = redirectOutput;
 
-        var fileName = Path.GetFullPath($"bin\\{mainFile}");
+        var fileName = BundledCoreManager.ResolveExecutable(mainFile, Global.NetchDir);
 
         if (!File.Exists(fileName))
             throw new MessageException(i18N.Translate($"bin\\{mainFile} file not found!"));
@@ -33,7 +33,7 @@ public abstract class Guard
             StartInfo =
             {
                 FileName = fileName,
-                WorkingDirectory = $"{Global.NetchDir}\\bin",
+                WorkingDirectory = Path.Combine(Global.NetchDir, "bin"),
                 CreateNoWindow = true,
                 UseShellExecute = !RedirectOutput,
                 RedirectStandardOutput = RedirectOutput,
@@ -43,6 +43,8 @@ public abstract class Guard
                 WindowStyle = ProcessWindowStyle.Hidden
             }
         };
+        if (mainFile.Equals("xray.exe", StringComparison.OrdinalIgnoreCase))
+            Instance.StartInfo.Environment["XRAY_LOCATION_ASSET"] = Path.Combine(Global.NetchDir, "bin");
     }
 
     protected string LogPath => Path.Combine(Global.NetchDir, $"logging\\{Name}.log");
@@ -63,13 +65,14 @@ public abstract class Guard
     {
         State = State.Starting;
 
-        _logFileStream = new FileStream(LogPath, FileMode.Create, FileAccess.Write, FileShare.Read, 4096, true);
-        _logStreamWriter = new StreamWriter(_logFileStream) { AutoFlush = true };
+        _logStreamWriter = new CoreLogWriter(LogPath);
 
         Instance.StartInfo.Arguments = argument;
         Instance.Start();
         _started = true;
         Global.Job.AddProcess(Instance);
+        Log.Information("Core started: {Core}, PID {Pid}", Name, Instance.Id);
+        await _logStreamWriter.WriteLineAsync($"=== {DateTimeOffset.Now:O} {Name} PID={Instance.Id} ===");
 
         if (priority != ProcessPriorityClass.Normal)
             Instance.PriorityClass = priority;
@@ -158,9 +161,6 @@ public abstract class Guard
                 try { await _outputTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch (Exception ex) { Log.Warning(ex, "Core output cleanup failed"); }
                 if (_logStreamWriter != null)
                     await _logStreamWriter.DisposeAsync();
-
-                if (_logFileStream != null)
-                    await _logFileStream.DisposeAsync();
 
                 Instance.Dispose();
 

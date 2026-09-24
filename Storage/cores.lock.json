@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "verifiedOn": "2026-09-24",
+  "cores": [
+    {
+      "id": "xray",
+      "version": "26.3.27",
+      "executable": "xray.exe",
+      "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip",
+      "archiveSha256": "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad",
+      "source": "https://github.com/XTLS/Xray-core/tree/v26.3.27",
+      "files": [
+        { "entry": "LICENSE", "name": "LICENSE", "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5" },
+        { "entry": "xray.exe", "name": "xray.exe", "sha256": "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1" }
+      ]
+    },
+    {
+      "id": "sing-box",
+      "version": "1.13.21",
+      "executable": "sing-box.exe",
+      "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-windows-amd64.zip",
+      "archiveSha256": "a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced",
+      "source": "https://github.com/SagerNet/sing-box/tree/v1.13.21",
+      "files": [
+        { "entry": "sing-box-1.13.21-windows-amd64/LICENSE", "name": "LICENSE", "sha256": "bb3805862b583aee73ad6f7805ec634747a37257a637a3069857843f05ea589c" },
+        { "entry": "sing-box-1.13.21-windows-amd64/libcronet.dll", "name": "libcronet.dll", "sha256": "257f966119ffca91d7a2ce110a4b668b865d88bf2ed5339fd06a5644b0d02823" },
+        { "entry": "sing-box-1.13.21-windows-amd64/sing-box.exe", "name": "sing-box.exe", "sha256": "ccb2fad603c89efcbc14358ab40b2c7000a5bb4e3bffa170d5c355cda90757ba" }
+      ]
+    }
+  ]
+}

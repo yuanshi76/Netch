@@ -10,6 +10,7 @@ using Netch.Controllers;
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("")]
 [assembly: AssemblyProduct(UpdateChecker.Name)]
+[assembly: AssemblyInformationalVersion(UpdateChecker.InformationalVersion)]
 [assembly: AssemblyCopyright(UpdateChecker.Copyright)]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]

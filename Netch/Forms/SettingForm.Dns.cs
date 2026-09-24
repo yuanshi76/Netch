@@ -14,6 +14,10 @@ public partial class SettingForm
     private TextBox _bootstrap = null!;
     private TextBox _localRules = null!;
     private NumericUpDown _dnsTimeout = null!;
+    private CheckBox _fakeIp = null!;
+    private TextBox _fakeRange = null!;
+    private TextBox _fakeRules = null!;
+    private NumericUpDown _fakeTtl = null!;
 
     private void InitializeDnsSettings()
     {
@@ -47,6 +51,21 @@ public partial class SettingForm
         Label("远程解析超时（毫秒）");
         _dnsTimeout = new NumericUpDown { Minimum = 1000, Maximum = 30000, Increment = 500, Value = Math.Clamp(policy.QueryTimeoutMs, 1000, 30000) };
         Add(_dnsTimeout);
+        _fakeIp = new CheckBox { Text = "启用 Fake-IP（先验证远程解析）", Checked = policy.FakeIpEnabled, AutoSize = true };
+        Add(_fakeIp);
+        Label("需要 TUN 或全进程接管，并关闭本地解析。域名恢复后仍按代理/直连规则处理。选择性进程及共享模式请保持关闭。TUN 仅支持 IPv4；IPv6 保护保持。");
+        Label("Fake-IP IPv4 地址池（198.18.0.0/15 内的 /15 至 /24 子网）");
+        _fakeRange = TextInput([policy.FakeIpRange], 26);
+        _fakeRange.Multiline = false; _fakeRange.ScrollBars = ScrollBars.None;
+        Label("映射有效期上限（秒；不超过远程 DNS 剩余有效期）");
+        _fakeTtl = new NumericUpDown { Minimum = 1, Maximum = 300, Value = Math.Clamp(policy.FakeIpTtlSeconds, 1, 300) };
+        Add(_fakeTtl);
+        Label("兼容域名（返回远程真实 IP；每行完整域名或 *.example.com，不允许本地解析）");
+        _fakeRules = TextInput(policy.FakeIpBypassDomains, 65);
+        Label("失效映射会拒绝连接，请让应用重新解析。地址池耗尽时可关闭 Fake-IP；请保留 data 中的分配记录，避免旧地址被重复使用。");
+        void EnableFakeFields() { _fakeRange.Enabled = _fakeTtl.Enabled = _fakeRules.Enabled = _fakeIp.Checked; }
+        _fakeIp.CheckedChanged += (_, _) => EnableFakeFields();
+        EnableFakeFields();
         Label("应用自己的 HTTPS DNS 需要该应用的流量也经过代理；仅代理部分进程不能保护其他进程的 HTTPS DNS。");
         var restore = new Button { Text = "停止并恢复系统 DNS", AutoSize = true };
         restore.Click += async (_, _) =>
@@ -75,7 +94,9 @@ public partial class SettingForm
         {
             AllowLocalResolution = _allowLocal.Checked,
             AllowLocalFallback = _allowLocal.Checked && _allowFallback.Checked,
-            RemoteResolvers = Lines(_remoteDns), LocalDomainRules = Lines(_localRules), QueryTimeoutMs = (int)_dnsTimeout.Value
+            RemoteResolvers = Lines(_remoteDns), LocalDomainRules = Lines(_localRules), QueryTimeoutMs = (int)_dnsTimeout.Value,
+            FakeIpEnabled = _fakeIp.Checked, FakeIpRange = _fakeRange.Text.Trim(),
+            FakeIpTtlSeconds = (int)_fakeTtl.Value, FakeIpBypassDomains = Lines(_fakeRules)
         };
         foreach (var line in Lines(_bootstrap))
         {

@@ -3,6 +3,7 @@
   <Import Project="..\common.props" />
 
   <PropertyGroup>
+    <BundleProxyCores Condition="'$(BundleProxyCores)' == '' and '$(Configuration)' == 'Release'">true</BundleProxyCores>
     <OutputType>WinExe</OutputType>
     <Configurations>Debug;Release</Configurations>
     <UseWindowsForms>true</UseWindowsForms>
@@ -22,11 +23,19 @@
     <TargetFramework>net8.0-windows10.0.17763.0</TargetFramework>
     <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
     <StartupObject></StartupObject>
-    <FileVersion>1.9.11</FileVersion>
+    <FileVersion>1.9.12</FileVersion>
 	<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
 	<SelfContained>true</SelfContained>
 	<RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
+
+  <Import Project="..\.build\cores\cores.props" Condition="'$(BundleProxyCores)' == 'true' and Exists('..\.build\cores\cores.props')" />
+  <ItemGroup Condition="'$(BundleProxyCores)' == 'true'">
+    <EmbeddedResource Include="..\Storage\cores.lock.json" LogicalName="Netch.BundledCores.manifest.json" />
+  </ItemGroup>
+  <Target Name="RequireBundledCores" BeforeTargets="PrepareForBuild" Condition="'$(BundleProxyCores)' == 'true'">
+    <Error Condition="!Exists('..\.build\cores\cores.props')" Text="Run prepare-cores.ps1 before building bundled proxy cores." />
+  </Target>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutputPath>bin\x64\Debug\</OutputPath>
@@ -37,6 +46,10 @@
     <OutputPath>bin\x64\Release\</OutputPath>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(BundleProxyCores)' == 'true'">
+    <DefineConstants>$(DefineConstants);BUNDLED_PROXY_CORES</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

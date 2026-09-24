@@ -21,6 +21,7 @@ internal static class Program
     private static int _passed;
     private static readonly byte[] Query = DnsWire.Query("example.test", 1, 1234);
     private static string _root = "";
+    private static string _coreDirectory = "";
     private static bool _offline;
     private static int _offlinePort = 62000;
 
@@ -28,9 +29,18 @@ internal static class Program
     private static int Main(string[] args)
     {
         _root = Path.GetFullPath(args.FirstOrDefault() ?? "../../../..");
+        _coreDirectory = args.FirstOrDefault(a => a.StartsWith("--core-directory="))?.Split('=', 2)[1] ?? "";
         _offline = args.Contains("--offline") || !args.Contains("--allow-listeners");
         try
         {
+            var remotePort = args.FirstOrDefault(a => a.StartsWith("--remote-path-probe="))?.Split('=', 2)[1];
+            if (remotePort != null) { LiveRemotePathProbe.RunAsync(int.Parse(remotePort)).GetAwaiter().GetResult(); return 0; }
+            var preflightPlan = args.FirstOrDefault(a => a.StartsWith("--guarded-preflight="))?.Split('=', 2)[1];
+            if (preflightPlan != null) { GuardedFakeIpAcceptance.Preflight(preflightPlan); return 0; }
+            var guardedPlan = args.FirstOrDefault(a => a.StartsWith("--guarded-plan="))?.Split('=', 2)[1];
+            if (guardedPlan != null) return GuardedFakeIpAcceptance.Run(guardedPlan);
+            var clientSession = args.FirstOrDefault(a => a.StartsWith("--guarded-client="))?.Split('=', 2)[1];
+            if (clientSession != null) { GuardedFakeIpAcceptance.ClientAsync(clientSession).GetAwaiter().GetResult(); return 0; }
             if (args.Contains("--render-ui")) { RenderUi(); return 0; }
             if (args.Contains("--firewall-integration")) { FirewallIntegration.Run(); return 0; }
             if (args.Contains("--live-dns")) { LiveDnsAcceptance.RunAsync(_root).GetAwaiter().GetResult(); return 0; }
@@ -38,6 +48,10 @@ internal static class Program
             if (args.Contains("--capture-acceptance")) return SystemAcceptance.Run(_root, true);
             if (args.Contains("--restore-acceptance")) { SystemAcceptance.RestoreAsync(_root).GetAwaiter().GetResult(); return 0; }
             if (args.Contains("--udp-client-lifecycle")) { _offline = false; TestUdpClientDeparture().GetAwaiter().GetResult(); Console.WriteLine("PASS UDP departed-client lifecycle"); return 0; }
+            if (args.Contains("--startup-probe")) { StartupProbeRegression.RunAsync(Test).GetAwaiter().GetResult(); Console.WriteLine($"PASS: {_passed} startup probe groups"); return 0; }
+            if (args.Contains("--fakeip-only")) { FakeIpRegression.RunAsync(_root, !_offline, Test).GetAwaiter().GetResult(); Console.WriteLine($"PASS: {_passed} Fake-IP groups"); return 0; }
+            if (args.Contains("--runtime-recovery")) { RuntimeRecoveryRegression.RunAsync(_root, Test).GetAwaiter().GetResult(); Console.WriteLine($"PASS: {_passed} runtime recovery groups"); return 0; }
+            if (args.Contains("--route-journal")) { RouteJournalRegression.RunAsync(_root, Test).GetAwaiter().GetResult(); Console.WriteLine($"PASS: {_passed} route journal groups"); return 0; }
             RunAsync().GetAwaiter().GetResult(); Console.WriteLine($"PASS: {_passed} regression groups"); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -73,6 +87,11 @@ internal static class Program
 
     private static async Task RunAsync()
     {
+        await CoreUpgradeRegression.RunAsync(_root, !_offline, Test);
+        await RuntimeRecoveryRegression.RunAsync(_root, Test);
+        await RouteJournalRegression.RunAsync(_root, Test);
+        await FakeIpRegression.RunAsync(_root, !_offline, Test);
+        if (!_offline) await SingboxLoopbackRegression.RunAsync(_root, CoreExecutable("sing-box.exe"), Test);
         await Test("policy defaults and compatibility validation", async () =>
         {
             var p = new DnsPolicyConfig(); p.Validate();
@@ -223,6 +242,7 @@ internal static class Program
             Check(Code(await task) == 2, "in flight response after exit");
         });
         await Test("faulted DNS receive cleanup is idempotent and allows runtime disposal", TestFaultedDnsCleanup);
+        await StartupProbeRegression.RunAsync(Test);
         if (!_offline)
         {
             await Test("UDP and TCP loopback listener supports both IP families", TestListeners);
@@ -438,10 +458,14 @@ internal static class Program
                 catch (Exception ex) when (ex is IOException or AuthenticationException) { Console.WriteLine("TLS fixture: " + ex.Message); }
             });
             using var transport = new RemoteDnsTransport(((IPEndPoint)listener.LocalEndpoint).Port);
+            var attempts = 0;
+            await using var service = new RemoteDnsService(new() { RemoteResolvers = [scheme + "://untrusted.invalid"] },
+                (endpoint, query, token) => { attempts++; return transport.QueryAsync(endpoint, query, token); });
             var rejected = false;
-            try { await transport.QueryAsync(new Uri(scheme + "://untrusted.invalid"), Query, timeout.Token); }
-            catch (Exception ex) when (ex is AuthenticationException or HttpRequestException) { rejected = true; }
-            Check(rejected, "TLS certificate was accepted"); await server; listener.Stop();
+            try { await service.ProbeAsync(timeout.Token); }
+            catch (MessageException ex) when (ex.Message.Contains("认证失败")) { rejected = true; }
+            Check(rejected && attempts == 1 && !service.Available, "TLS certificate must be rejected without startup retry");
+            await server; listener.Stop();
         }
     }
 
@@ -513,6 +537,18 @@ internal static class Program
             var c = await SingboxConfigUtils.GenerateClientConfigAsync(s);
             Check(c.outbounds[0].server == "192.0.2.7" && c.outbounds[0].tls.server_name == "node.test", "sing-box SNI");
             await CheckCore("sing-box.exe", "singbox-" + protocol, c);
+            foreach (var sniff in new[] { false, true })
+            {
+                Global.Settings.V2RayConfig.CoreBasicItem.SniffingEnabled = sniff;
+                c = await SingboxConfigUtils.GenerateClientConfigAsync(s);
+                var json = JsonSerializer.Serialize(c, Global.NewCustomJsonSerializerOptions());
+                using var doc = JsonDocument.Parse(json);
+                Check(doc.RootElement.GetProperty("inbounds").EnumerateArray().All(i => !i.TryGetProperty("sniff", out _)), "legacy sniff must not be serialized");
+                Check(c.route.rules[0].inbound.SequenceEqual(new[] { RemoteDnsService.TransportTag }) && c.route.rules[0].action == "route", "DNS route precedes sniff");
+                Check(c.route.rules.Count(r => r.action == "sniff") == (sniff ? 1 : 0), "sniff setting preserved");
+                if (sniff) Check(c.route.rules.Single(r => r.action == "sniff").inbound.SequenceEqual(new[] { "mixed" }), "sniff applies only to mixed inbound");
+                await CheckCore("sing-box.exe", "singbox-" + protocol + "-sniff-" + sniff, c);
+            }
         }
     }
     private static async Task CheckCore<T>(string executable, string name, T config)
@@ -521,7 +557,7 @@ internal static class Program
         var path = Path.Combine(directory, name + ".json");
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(config, Global.NewCustomJsonSerializerOptions()));
         if (_offline) return; // No proxy/core process is launched in offline mode.
-        var info = new ProcessStartInfo(Path.Combine(_root, ".build", "baseline", executable))
+        var info = new ProcessStartInfo(CoreExecutable(executable))
         { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = directory };
         foreach (var arg in executable == "xray.exe" ? new[] { "run", "-test", "-c", path } : new[] { "check", "-c", path }) info.ArgumentList.Add(arg);
         using var process = Process.Start(info)!;
@@ -531,6 +567,10 @@ internal static class Program
         var log = await output + await error; await File.WriteAllTextAsync(Path.Combine(directory, name + ".log"), log);
         Check(process.ExitCode == 0, name + " config check failed: " + log);
     }
+
+    private static string CoreExecutable(string executable) => string.IsNullOrEmpty(_coreDirectory)
+        ? Netch.Services.BundledCoreManager.ResolveExecutable(executable, Global.NetchDir)
+        : Path.GetFullPath(Path.Combine(_coreDirectory, executable));
 
     private static Task TestFirewallRuleObjects()
     {
@@ -633,7 +673,7 @@ internal static class Program
         var directory = Path.Combine(_root, ".build", "regression");
         var path = Path.Combine(directory, "xray-runtime.json");
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(config, Global.NewCustomJsonSerializerOptions()));
-        var info = new ProcessStartInfo(Path.Combine(_root, ".build", "baseline", "xray.exe"))
+        var info = new ProcessStartInfo(CoreExecutable("xray.exe"))
         { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = directory };
         foreach (var argument in new[] { "run", "-c", path }) info.ArgumentList.Add(argument);
         using var process = Process.Start(info)!;

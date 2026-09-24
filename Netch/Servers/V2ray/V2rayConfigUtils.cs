@@ -31,7 +31,7 @@ public static class V2rayConfigUtils
         // The only core resolver is the local policy broker. It never performs system fallback.
         v2rayConfig.dns = new
         {
-            servers = new[] { new { address = "tcp+local://127.0.0.1:53", domains = new[] { "regexp:.*" }, skipFallback = true } },
+            servers = new[] { new { address = $"tcp+local://127.0.0.1:{DnsRuntime.CoreDnsPort}", domains = new[] { "regexp:.*" }, skipFallback = true } },
             disableCache = true, disableFallback = true
         };
         v2rayConfig.inbounds = [GenerateInbound(), new Inbounds4Ray
@@ -52,6 +52,9 @@ public static class V2rayConfigUtils
         }
         else dnsRoute.outboundTag = ProxyTag;
         v2rayConfig.routing.rules.Insert(0, dnsRoute);
+        // Restored destinations are names. An address still in a Fake-IP pool is never an Internet destination.
+        if (v2rayConfig.outbounds.All(o => o.tag != BlockTag)) v2rayConfig.outbounds.Add(BuildBlockOutbound());
+        v2rayConfig.routing.rules.Insert(1, new RulesItem4Ray { type = "field", ip = [FakeIpPool.ReservedV4, FakeIpPool.ReservedV6], outboundTag = BlockTag });
         if (v2rayConfig.routing.balancers is { Count: > 0 })
             v2rayConfig.observatory = new Observatory4Ray
             {
@@ -979,9 +982,9 @@ public static class V2rayConfigUtils
     {
         var inbound = new Inbounds4Ray();
         inbound.tag = EInboundProtocol.mixed.ToString();
-        inbound.port = Global.Settings.Socks5LocalPort;
+        inbound.port = DnsRuntime.ApplicationCorePort;
         inbound.protocol = EInboundProtocol.mixed.ToString();
-        inbound.listen = Global.Settings.LocalAddress;
+        inbound.listen = Global.Settings.DnsPolicy.FakeIpEnabled ? "127.0.0.1" : Global.Settings.LocalAddress;
 
         inbound.settings = new Inboundsettings4Ray();
         inbound.settings.auth = "noauth";

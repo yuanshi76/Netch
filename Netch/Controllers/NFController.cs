@@ -63,6 +63,7 @@ public class NFController : IModeController
 
         if (!await InitAsync())
             throw new MessageException("Redirector start failed.");
+        if (!_mode.FilterLoopback) Netch.Services.NfLoopbackPolicy.Apply();
     }
 
     public Task StopAsync()

@@ -50,7 +50,7 @@ public partial class MainForm : Form
         FormClosed += (_, _) => DnsRuntime.StatusChanged -= DnsStatusChanged;
         Shown += (_, _) =>
         {
-            if (DnsRuntime.Protection.Active)
+            if (DnsRuntime.Protection.Active && !Program.StartRequested && !Global.Settings.StartWhenOpened)
                 MessageBoxX.Show("检测到保留的 DNS 保护。重新连接代理可继续使用；需要恢复普通联网，请选择“服务器 → 停止并恢复系统 DNS”。");
         };
 
@@ -243,7 +243,7 @@ public partial class MainForm : Form
             UpdateServersFromSubscriptionAsync().Forget();
 
         // 打开软件时启动加速，产生开始按钮点击事件
-        if (Global.Settings.StartWhenOpened)
+        if (Global.Settings.StartWhenOpened || Program.StartRequested)
             ControlButton.PerformClick();
 
         Program.SingleInstance.StartListenServer();
@@ -730,6 +730,7 @@ public partial class MainForm : Form
     {
         if (!IsWaiting())
         {
+            Log.Information("Proxy stop requested by main window control");
             await StopCoreAsync();
             return;
         }

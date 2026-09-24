@@ -25,6 +25,7 @@ public sealed class DnsProtectionController
     {
         public int Version { get; set; } = 1;
         public bool BlockIpv6 { get; set; }
+        public bool BlockFakeIp { get; set; }
         public List<AdapterState> Adapters { get; set; } = [];
     }
     public sealed class AdapterState
@@ -35,17 +36,18 @@ public sealed class DnsProtectionController
         public string[] StaticServers { get; set; } = [];
     }
 
-    public static string[] RuleNames => [RulePrefix + "TCP", RulePrefix + "UDP", RulePrefix + "IPv6"];
+    public static string[] RuleNames => [RulePrefix + "TCP", RulePrefix + "UDP", RulePrefix + "IPv6", RulePrefix + "FakeIP"];
 
-    public async Task EnableAsync(bool blockIpv6)
+    public async Task EnableAsync(bool blockIpv6, bool blockFakeIp = false)
     {
         await _gate.WaitAsync();
         try
         {
             LoadJournal();
-            _journal.BlockIpv6 |= blockIpv6;
+            _journal.BlockIpv6 = blockIpv6;
+            _journal.BlockFakeIp |= blockFakeIp;
             await SaveJournalAsync(); // Save recovery metadata before any system mutation.
-            await Task.Run(() => InstallRules(_journal.BlockIpv6));
+            await Task.Run(() => InstallRules(_journal.BlockIpv6, _journal.BlockFakeIp));
             _active = true;
             await ProtectAdaptersAsync();
             if (!_watching)
@@ -78,7 +80,7 @@ public sealed class DnsProtectionController
         return Activator.CreateInstance(type)!;
     }
 
-    private static void InstallRules(bool blockIpv6)
+    private static void InstallRules(bool blockIpv6, bool blockFakeIp)
     {
         dynamic policy = Policy();
         foreach (var profile in new[] { 1, 2, 4 })
@@ -89,6 +91,33 @@ public sealed class DnsProtectionController
         AddRule(policy, RulePrefix + "TCP", 6, "53,853,5353,5355,137", RemoteAddresses, true);
         AddRule(policy, RulePrefix + "UDP", 17, "53,853,5353,5355,137", RemoteAddresses, true);
         if (blockIpv6) AddRule(policy, RulePrefix + "IPv6", 256, null, "::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true);
+        if (!blockIpv6) RemoveOwnedRule((object)policy.Rules, RulePrefix + "IPv6");
+        if (blockFakeIp) AddFakeIpRule((object)policy, NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback && n.Name != "Netch" &&
+                (n.Supports(NetworkInterfaceComponent.IPv4) || n.Supports(NetworkInterfaceComponent.IPv6))).Select(n => n.Name).ToArray());
+    }
+
+    private static void AddFakeIpRule(object policyObject, string[] interfaces)
+    {
+        if (interfaces.Length == 0) throw new MessageException("无法确定 Fake-IP 外部出口，已停止启动。");
+        dynamic policy = policyObject;
+        var name = RulePrefix + "FakeIP";
+        dynamic existing = FindRule((object)policy.Rules, name);
+        if (existing != null && ((string)existing.Grouping != "Netch DNS Protection" ||
+            !string.IsNullOrEmpty((string?)existing.ApplicationName) || !string.IsNullOrEmpty((string?)existing.ServiceName) || (int)existing.Protocol != 256))
+            throw new MessageException("已有 Fake-IP 防护规则不属于当前范围，请先停止并恢复系统 DNS。");
+        dynamic rule = existing ?? Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FWRule")!)!;
+        if (existing == null)
+        {
+            rule.Name = name; rule.Grouping = "Netch DNS Protection";
+            rule.Description = "Netch Fake-IP addresses cannot leave external interfaces. Restore using Netch.";
+        }
+        rule.Action = 0; rule.Direction = 2; rule.Protocol = 256;
+        rule.LocalAddresses = "*"; rule.RemoteAddresses = FakeIpPool.ReservedV4 + "," + FakeIpPool.ReservedV6;
+        rule.Profiles = int.MaxValue;
+        rule.Interfaces = interfaces.Cast<object>().ToArray();
+        rule.Enabled = true;
+        if (existing == null) policy.Rules.Add(rule);
     }
 
     private static void AddRule(dynamic policy, string name, int protocol, string? ports, string addresses, bool enabled)
@@ -213,7 +242,8 @@ public sealed class DnsProtectionController
         try
         {
             if (!_active) return;
-            await Task.Run(() => InstallRules(_journal.BlockIpv6));
+            await Task.Run(() => InstallRules(_journal.BlockIpv6, _journal.BlockFakeIp));
+            if (_journal.BlockFakeIp) FakeIpModePolicy.CheckNetworkConflicts(true);
             await ProtectAdaptersAsync();
         }
         catch (Exception ex) { Log.Error(ex, "DNS protection update failed"); Failed?.Invoke("网络变化后 DNS 保护更新失败，外部 DNS 阻断保持。" + ex.Message); }

@@ -25,6 +25,7 @@ param (
 Push-Location (Split-Path $MyInvocation.MyCommand.Path -Parent)
 
 $ErrorActionPreference = 'Stop'
+& (Join-Path $PSScriptRoot 'prepare-cores.ps1')
 $taskBuildRoot = [IO.Path]::GetFullPath($PWD.Path).TrimEnd('\')
 $taskOutput = [IO.Path]::GetFullPath((Join-Path $taskBuildRoot $OutputPath))
 if (-not $taskOutput.StartsWith($taskBuildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -64,6 +65,7 @@ cp -Force '.\Other\release\GeoLite2-Country.mmdb' "$OutputPath\bin"
 		-c $Configuration `
 		-r 'win-x64' `
 		-p:Platform='x64' `
+		-p:BundleProxyCores=true `
 		-p:SelfContained=$SelfContained `
 		-p:PublishTrimmed=$False `
 		-p:PublishSingleFile=$PublishSingleFile `

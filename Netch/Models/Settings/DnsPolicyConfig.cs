@@ -11,6 +11,10 @@ public sealed class DnsPolicyConfig
     public List<string> LocalDomainRules { get; set; } = [];
     public Dictionary<string, string> BootstrapMappings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public int QueryTimeoutMs { get; set; } = 5000;
+    public bool FakeIpEnabled { get; set; }
+    public string FakeIpRange { get; set; } = "198.18.0.0/15";
+    public int FakeIpTtlSeconds { get; set; } = 60;
+    public List<string> FakeIpBypassDomains { get; set; } = ["localhost", "*.localhost", "*.lan", "*.local"];
 
     public void Validate()
     {
@@ -30,6 +34,12 @@ public sealed class DnsPolicyConfig
             throw new MessageException("DNS 总超时必须在 1000 至 30000 毫秒之间。");
         if (AllowLocalFallback && !AllowLocalResolution)
             throw new MessageException("本地 DNS 已关闭，不能启用本地回退。");
+        if (FakeIpBypassDomains == null || FakeIpTtlSeconds is < 1 or > 300)
+            throw new MessageException("Fake-IP 配置无效：映射 TTL 必须为 1 至 300 秒。");
+        _ = Services.Dns.FakeIpPool.ParseRange(FakeIpRange);
+        foreach (var rule in FakeIpBypassDomains) Services.Dns.FakeIpPool.ValidateDomainRule(rule);
+        if (FakeIpEnabled && (AllowLocalResolution || AllowLocalFallback))
+            throw new MessageException("验证型 Fake-IP 需要关闭本地 DNS 解析和本地回退。");
         foreach (var pair in BootstrapMappings)
             if (string.IsNullOrWhiteSpace(pair.Key) || !IPAddress.TryParse(pair.Value, out _))
                 throw new MessageException("节点连接映射格式必须为：域名=IP地址。");

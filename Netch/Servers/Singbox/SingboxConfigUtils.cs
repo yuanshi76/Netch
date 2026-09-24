@@ -22,7 +22,7 @@ public static class SingboxConfigUtils
 
         singboxConfig.dns = new Dns4Sbox
         {
-            servers = [new Server4Sbox { type = "tcp", tag = "dns-policy", server = "127.0.0.1", server_port = 53 }],
+            servers = [new Server4Sbox { type = "tcp", tag = "dns-policy", server = "127.0.0.1", server_port = DnsRuntime.CoreDnsPort }],
             final = "dns-policy", disable_cache = true
         };
         singboxConfig.inbounds = [GenerateInbound(), new Inbound4Sbox
@@ -37,9 +37,53 @@ public static class SingboxConfigUtils
             default_domain_resolver = new Rule4Sbox { server = "dns-policy" },
             final = "proxy", rules = [new Rule4Sbox { inbound = [RemoteDnsService.TransportTag], action = "route", outbound = "proxy" }]
         };
-
-
+        // sing-box 1.13 removed inbound.sniff. Keep DNS transport ahead of sniffing.
+        singboxConfig.route.rules.Add(new Rule4Sbox { ip_cidr = [FakeIpPool.ReservedV4, FakeIpPool.ReservedV6], action = "reject" });
+        if (Global.Settings.V2RayConfig.CoreBasicItem.SniffingEnabled)
+            singboxConfig.route.rules.Add(new Rule4Sbox { inbound = [EInboundProtocol.mixed.ToString()], action = "sniff" });
+        if (Global.Settings.DnsPolicy.FakeIpEnabled) AddFakeIpDomainRules(singboxConfig);
         return singboxConfig;
+    }
+
+    private static void AddFakeIpDomainRules(SingboxConfig config)
+    {
+        var profile = Global.Settings.RoutingProfiles.FirstOrDefault(p => p.Enabled && p.Id == Global.Settings.ActiveRoutingProfileId);
+        foreach (var source in profile?.Rules.Where(r => r.Enabled) ?? [])
+        {
+            // Process identity is lost at the mixed inbound. Xray geodata and chained
+            // outbounds cannot be translated by silently dropping their conditions.
+            if (source.Ip.Count != 0 || source.Process.Count != 0 || source.InboundTag.Count != 0 ||
+                source.OutboundServerId is not (RoutingOutbound.Proxy or RoutingOutbound.Direct or RoutingOutbound.Block))
+                throw new MessageException("sing-box Fake-IP 当前支持域名、端口、TCP/UDP 和协议条件，以及 DIRECT/BLOCK/当前代理。请移除不兼容条件或改用 Xray。");
+            var item = new Rule4Sbox();
+            foreach (var value in source.Domain.Select(s => s.Trim()).Where(s => s.Length != 0))
+            {
+                if (value.StartsWith("full:")) (item.domain ??= []).Add(new System.Globalization.IdnMapping().GetAscii(value[5..].TrimEnd('.')));
+                else if (value.StartsWith("domain:")) (item.domain_suffix ??= []).Add(new System.Globalization.IdnMapping().GetAscii(value[7..].TrimEnd('.')));
+                else if (value.StartsWith("regexp:")) (item.domain_regex ??= []).Add(value[7..]);
+                else if (value.Contains(':')) throw new MessageException("sing-box Fake-IP 不支持该域名规则：" + value);
+                else (item.domain_keyword ??= []).Add(value);
+            }
+            foreach (var port in source.Port.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var bounds = port.Split('-');
+                if (bounds.Length is < 1 or > 2 || bounds.Any(p => !int.TryParse(p, out var n) || n is < 1 or > 65535) ||
+                    bounds.Length == 2 && int.Parse(bounds[0]) > int.Parse(bounds[1])) throw new MessageException("无效的路由端口：" + port);
+                if (bounds.Length == 1) (item.port ??= []).Add(int.Parse(port));
+                else (item.port_range ??= []).Add(string.Join(':', bounds));
+            }
+            var networks = source.Network.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (networks.Any(n => n is not ("tcp" or "udp"))) throw new MessageException("路由网络必须为 tcp 或 udp。");
+            if (networks.Length != 0) item.network = networks.ToList();
+            if (source.Protocol.Count != 0) item.protocol = source.Protocol.ToList();
+            if (source.Domain.Count == 0 && item.port == null && item.port_range == null && item.network == null && item.protocol == null) continue;
+            item.inbound = [EInboundProtocol.mixed.ToString()];
+            item.action = source.OutboundServerId == RoutingOutbound.Block ? "reject" : "route";
+            if (item.action == "route") item.outbound = source.OutboundServerId;
+            if (item.outbound == RoutingOutbound.Direct && config.outbounds.All(o => o.tag != RoutingOutbound.Direct))
+                config.outbounds.Add(new Outbound4Sbox { tag = RoutingOutbound.Direct, type = "direct" });
+            config.route.rules.Add(item);
+        }
     }
 
     private static Inbound4Sbox GenerateInbound()
@@ -47,9 +91,8 @@ public static class SingboxConfigUtils
         var inbound = new Inbound4Sbox();
         inbound.tag = EInboundProtocol.mixed.ToString();
         inbound.type = EInboundProtocol.mixed.ToString();
-        inbound.listen = Global.Settings.LocalAddress;
-        inbound.listen_port = Global.Settings.Socks5LocalPort;
-        inbound.sniff = Global.Settings.V2RayConfig.CoreBasicItem.SniffingEnabled;
+        inbound.listen = Global.Settings.DnsPolicy.FakeIpEnabled ? "127.0.0.1" : Global.Settings.LocalAddress;
+        inbound.listen_port = DnsRuntime.ApplicationCorePort;
         return inbound;
     }
 

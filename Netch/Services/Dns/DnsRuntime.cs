@@ -11,6 +11,13 @@ public static class DnsRuntime
     public static DnsProtectionController Protection { get; } = new(Configuration.DataDirectoryFullName);
     public static RemoteDnsService? Service { get; private set; }
     private static RemoteDnsTransport? _transport;
+    private static FakeIpProxy? _fakeProxy;
+    public static FakeIpPool? FakePool { get; private set; }
+    public static bool FakeReady { get; private set; }
+    public static void ActivateFakeIp() => FakeReady = TransportReady && Service?.Available == true;
+    public static int CoreDnsPort { get; private set; } = 53;
+    public static int CoreProxyPort { get; private set; }
+    public static int ApplicationCorePort => Global.Settings.DnsPolicy.FakeIpEnabled ? CoreProxyPort : Global.Settings.Socks5LocalPort;
     public static int TransportPort { get; private set; }
     public static bool TransportReady { get; private set; }
     public static string Status { get; private set; } = "";
@@ -19,7 +26,7 @@ public static class DnsRuntime
     public static HashSet<IPAddress> ConnectionAddresses { get; } = [];
     public static bool Ipv4Only { get; set; }
 
-    static DnsRuntime() => Protection.Failed += Report;
+    static DnsRuntime() => Protection.Failed += message => { Suspend(); Report(message); };
     public static void Report(string status)
     {
         Status = status;
@@ -38,12 +45,36 @@ public static class DnsRuntime
         while (TransportPort == Global.Settings.Socks5LocalPort || TransportPort == 53)
             TransportPort = PortHelper.GetAvailablePort(PortType.TCP);
         var snapshot = JsonSerializer.Deserialize<DnsPolicyConfig>(JsonSerializer.Serialize(Global.Settings.DnsPolicy))!;
+        CoreDnsPort = 53; CoreProxyPort = Global.Settings.Socks5LocalPort;
+        int PrivatePort()
+        {
+            int port;
+            do { port = PortHelper.GetAvailablePort(PortType.TCP); }
+            while (port is 0 or 53 || port == TransportPort || port == CoreDnsPort || port == CoreProxyPort || port == Global.Settings.Socks5LocalPort);
+            return port;
+        }
+        if (snapshot.FakeIpEnabled)
+        {
+            CoreDnsPort = PrivatePort(); CoreProxyPort = PrivatePort();
+            FakePool = new(Configuration.DataDirectoryFullName, snapshot.FakeIpRange);
+        }
         _transport = new(TransportPort);
         var local = snapshot.AllowLocalResolution ? new LocalDnsTransport() : null;
-        Service = new(snapshot, _transport.QueryAsync, local == null ? null : local.QueryAsync);
+        Service = new(snapshot, _transport.QueryAsync, local == null ? null : local.QueryAsync, FakePool, !Ipv4Only, () => FakeReady);
         Service.StatusChanged += Report;
         Service.ListenerFailed += OnListenerFailed;
-        try { Service.Listen(); }
+        try
+        {
+            Service.Listen();
+            if (FakePool != null)
+            {
+                Service.ListenRealOnly(CoreDnsPort);
+                _fakeProxy = new(FakePool, CoreProxyPort, IPAddress.Parse(Global.Settings.LocalAddress), Global.Settings.Socks5LocalPort,
+                    () => FakeReady && TransportReady && Service?.Available == true);
+                _fakeProxy.Failed += message => { Suspend(); Report(message); };
+                _fakeProxy.Start();
+            }
+        }
         catch { await DisposeServiceAsync(); throw; }
     }
 
@@ -51,26 +82,32 @@ public static class DnsRuntime
     {
         if (Service == null) throw new InvalidOperationException();
         TransportReady = true;
-        try { await Service.ProbeAsync(); }
+        try { await Service.ProbeAsync(); Service.StartRecoveryMonitor(); }
         catch { TransportReady = false; throw; }
     }
 
     public static void Suspend()
     {
+        FakeReady = false;
         TransportReady = false;
         Service?.MarkUnavailable();
+        _fakeProxy?.Suspend();
+        FakePool?.Dispose();
         if (Protection.Active) Report("代理已停止，DNS 保护保持；可在设置中恢复系统 DNS。");
     }
 
     public static async Task DisposeServiceAsync()
     {
+        FakeReady = false;
         TransportReady = false;
         var service = Service;
         var transport = _transport;
+        var fakeProxy = _fakeProxy; var fakePool = FakePool;
         // Detach first: cleanup errors cannot leave an unusable object pinned to the
         // runtime and make every subsequent startup retry dispose that same object.
         Service = null;
         _transport = null;
+        _fakeProxy = null; FakePool = null;
         try
         {
             if (service != null)
@@ -80,7 +117,11 @@ public static class DnsRuntime
                 await service.DisposeAsync();
             }
         }
-        finally { transport?.Dispose(); }
+        finally
+        {
+            try { if (fakeProxy != null) await fakeProxy.DisposeAsync(); }
+            finally { fakePool?.Dispose(); transport?.Dispose(); CoreDnsPort = 53; CoreProxyPort = 0; }
+        }
     }
 
     private static void OnListenerFailed(string message) { TransportReady = false; Report(message); }
@@ -117,7 +158,7 @@ public static class DnsRuntime
         }
         foreach (var type in family == AddressFamily.InterNetworkV6 ? new ushort[] { 28 } : family == AddressFamily.InterNetwork ? new ushort[] { 1 } : new ushort[] { 1, 28 })
         {
-            var response = await Service.QueryAsync(DnsWire.Query(hostname, type, (ushort)Random.Shared.Next(65536)), token);
+            var response = await Service.QueryRealAsync(DnsWire.Query(hostname, type, (ushort)Random.Shared.Next(65536)), token);
             var code = DnsWire.U16(response, 2) & 15;
             if (code == 2) throw new MessageException("远程 DNS 不可用，未回退本地。");
             if (code == 3) return null;

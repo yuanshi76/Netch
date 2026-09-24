@@ -9,12 +9,13 @@ using Netch.Services.Dns;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using Netch.Services;
 
 namespace Netch.Controllers
 {
     public class TUNController : IModeController
     {
-        private readonly List<NetRoute> _ownedRoutes = [];
+        private OwnedRouteJournal? _routes;
 
         private TunMode _mode = new();
         private TUNConfig _tunConfig = new();
@@ -34,6 +35,8 @@ namespace Netch.Controllers
 
             _mode = tunMode;
             _tunConfig = Global.Settings.TUNTAP;
+            _routes = new(Path.Combine(Configuration.DataDirectoryFullName, "tun-owned-routes.json"));
+            _routes.Restore();
 
             _outbound = NetRoute.GetBestRouteTemplate();
             if (!File.Exists(Path.Combine(Global.NetchDir, Constants.WintunDllFile)))
@@ -55,7 +58,7 @@ namespace Netch.Controllers
             {
                 await Task.Delay(200);
                 var now = NetworkInterface.GetAllNetworkInterfaces();
-                var networkInterface = now.FirstOrDefault(x => x.Name.StartsWith(InterfaceName));
+                var networkInterface = now.FirstOrDefault(x => x.Name == InterfaceName);
                 if (networkInterface == null)
                 {
                     continue;
@@ -80,8 +83,8 @@ namespace Netch.Controllers
 
         public async Task StopAsync()
         {
-            await Task.Run(ClearRouteTable);
-            if (!await TUN2Socks.FreeAsync()) throw new MessageException("tun2socks 停止失败。");
+            try { await Task.Run(ClearRouteTable); }
+            finally { if (!await TUN2Socks.FreeAsync()) throw new MessageException("tun2socks 停止失败。"); }
         }
 
         #region Route
@@ -100,21 +103,20 @@ namespace Netch.Controllers
             AddRoutes(_tun, _mode.Handle);
             AddRoutes(_outbound, _mode.Bypass);
 
+            if (Global.Settings.DnsPolicy.FakeIpEnabled)
+                AddRoute(_tun.FillTemplate("198.18.0.0", 15));
+
             NetworkInterfaceUtils.SetInterfaceMetric(_tun.InterfaceIndex, 0);
         }
 
         private void ClearRouteTable()
         {
-            foreach (var route in _ownedRoutes.AsEnumerable().Reverse())
-                if (!RouteUtils.DeleteRoute(route)) Log.Warning("Could not remove Netch route {Network}", route.Network);
-            _ownedRoutes.Clear();
+            _routes?.Restore();
         }
 
         private void AddRoute(NetRoute route)
         {
-            if (_ownedRoutes.Any(r => r.Network == route.Network && r.Cidr == route.Cidr && r.InterfaceIndex == route.InterfaceIndex)) return;
-            if (!RouteUtils.CreateRoute(route)) throw new MessageException($"路由创建失败：{route.Network}/{route.Cidr}，已停止启动。");
-            _ownedRoutes.Add(route);
+            _routes!.Add(OwnedRouteJournal.Describe(route));
         }
 
         private void AddRoutes(NetRoute template, IEnumerable<string> rules)

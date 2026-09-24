@@ -19,6 +19,7 @@ public static class Program
     public static readonly ISingleInstanceService SingleInstance = new SingleInstanceService($"Global\\{nameof(Netch)}");
 
     internal static HWND ConsoleHwnd { get; private set; }
+    public static bool StartRequested { get; private set; }
 
 #pragma warning disable VSTHRD002
     // VSTHRD002: Avoid problematic synchronous waits
@@ -28,6 +29,7 @@ public static class Program
     public static void Main(string[] args)
     {
         // handle arguments
+        StartRequested = args.Contains(Constants.Parameter.Start);
         if (args.Contains(Constants.Parameter.ForceUpdate))
             Flags.AlwaysShowNewVersionFound = true;
 
@@ -56,7 +58,6 @@ public static class Program
             if (!Directory.Exists(item))
                 Directory.CreateDirectory(item);
 
-        CleanLoggingDirectory();
 
         InitConsole();
         CreateLogger();
@@ -166,46 +167,13 @@ public static class Program
 #endif
             .WriteTo.Async(c => c.File(Path.Combine(Global.NetchDir, Constants.LogFile),
                 outputTemplate: Constants.OutputTemplate,
-                rollOnFileSizeLimit: false))
+                fileSizeLimitBytes: 4 * 1024 * 1024,
+                retainedFileCountLimit: 5,
+                rollOnFileSizeLimit: true))
             .WriteTo.Console(outputTemplate: Constants.OutputTemplate)
             .MinimumLevel.Override(@"Microsoft", LogEventLevel.Information)
             .Enrich.FromLogContext()
             .CreateLogger();
-    }
-
-    private static void CleanLoggingDirectory()
-    {
-        if (!Directory.Exists("logging"))
-        {
-            return;
-        }
-
-        var directory = new DirectoryInfo("logging");
-        foreach (var file in directory.GetFiles())
-        {
-            TryDelete(() => file.Delete());
-        }
-
-        foreach (var dir in directory.GetDirectories())
-        {
-            TryDelete(() => dir.Delete(true));
-        }
-    }
-
-    private static void TryDelete(Action delete)
-    {
-        try
-        {
-            delete();
-        }
-        catch (IOException)
-        {
-            // A previous Netch/Xray process or log viewer may still hold the file.
-        }
-        catch (UnauthorizedAccessException)
-        {
-            // Keep startup resilient even when a log file is temporarily locked.
-        }
     }
 
     private static void Application_OnException(object sender, ThreadExceptionEventArgs e)

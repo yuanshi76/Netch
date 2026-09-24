@@ -199,7 +199,7 @@ extern "C" {
 		{
 			memset(&rule, 0, sizeof(NF_RULE));
 			rule.ip_family = AF_INET;
-			inet_pton(AF_INET, "127.0.0.1", rule.remoteIpAddress);
+			inet_pton(AF_INET, "127.0.0.0", rule.remoteIpAddress);
 			inet_pton(AF_INET, "255.0.0.0", rule.remoteIpAddressMask);
 			rule.filteringFlag = NF_ALLOW;
 			nf_addRule(&rule, FALSE);
@@ -208,6 +208,15 @@ extern "C" {
 			rule.ip_family = AF_INET6;
 			rule.remoteIpAddress[15] = 1;
 			memset(rule.remoteIpAddressMask, 0xff, sizeof(rule.remoteIpAddressMask));
+			rule.filteringFlag = NF_ALLOW;
+			nf_addRule(&rule, FALSE);
+
+			// Dual-stack clients can represent an IPv4 loopback destination as
+			// ::ffff:127.x.y.z. Keep these local when loopback filtering is off.
+			memset(&rule, 0, sizeof(NF_RULE));
+			rule.ip_family = AF_INET6;
+			inet_pton(AF_INET6, "::ffff:127.0.0.0", rule.remoteIpAddress);
+			memset(rule.remoteIpAddressMask, 0xff, 13); // /104
 			rule.filteringFlag = NF_ALLOW;
 			nf_addRule(&rule, FALSE);
 		}

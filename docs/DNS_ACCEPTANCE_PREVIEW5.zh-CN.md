@@ -14,7 +14,7 @@
 
 ## 验收条件
 
-这是 2026-09-23 的历史构建验收记录。当前交付为 preview.6，见[任务总结与实施状态](DNS_IMPLEMENTATION_STATUS.zh-CN.md)；本文末尾校验值仅对应当时的 preview.5 文件。
+这是 2026-09-23 的历史构建验收记录。当前交付见[任务总结与实施状态](DNS_IMPLEMENTATION_STATUS.zh-CN.md)；本文末尾校验值仅对应当时的 preview.5 文件。
 
 用户授权代理启停和监听测试，并明确要求保留 FastLink。本次结果限定在 Windows 当前 WLAN、FastLink 隧道同时运行的环境。使用 D:\Netch 现有组件的副本、当前节点和 DNS 配置；未覆盖现用 EXE、设置或 bin 文件。
 

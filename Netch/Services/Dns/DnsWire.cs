@@ -134,6 +134,21 @@ public static class DnsWire
         _ = Addresses(response); // Validate CNAME compression before forwarding or caching.
     }
 
+    public static bool RequestsDnssec(byte[] query) => (U16(query, 2) & 0x0030) != 0 ||
+        Records(query).Any(r => r.Type == 41 && (r.Ttl & 0x8000) != 0);
+
+    public static byte[] AddressAnswer(byte[] query, IPAddress address, uint ttl)
+    {
+        var result = Error(query, 0); // Synthetic answer never copies AD/AA/signatures.
+        var offset = result.Length; var bytes = address.GetAddressBytes();
+        Array.Resize(ref result, offset + 12 + bytes.Length);
+        Put16(result, 6, 1); result[offset] = 0xc0; result[offset + 1] = 12;
+        Put16(result, offset + 2, (ushort)(bytes.Length == 4 ? 1 : 28)); Put16(result, offset + 4, 1);
+        BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(offset + 6), ttl);
+        Put16(result, offset + 10, (ushort)bytes.Length); bytes.CopyTo(result, offset + 12);
+        return result;
+    }
+
     public readonly record struct Record(string Name, ushort Type, ushort Class, uint Ttl, int TtlOffset, int DataOffset, int Length, bool IsAnswer);
     public static IEnumerable<Record> Records(byte[] response)
     {

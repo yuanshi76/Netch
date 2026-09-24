@@ -20,17 +20,12 @@ public static class Firewall
 
         try
         {
-            var rule = FirewallManager.Instance.Rules.FirstOrDefault(r => r.Name == Netch);
-            if (rule != null)
-            {
-                if (rule.ApplicationName.StartsWith(Global.NetchDir))
-                    return;
-
-                RemoveNetchFwRules();
-            }
-
+            // An existing rule for an older version must not suppress new core paths.
+            var covered = FirewallManager.Instance.Rules.Where(r => r.Name == Netch
+                    && r.Direction == FirewallDirection.Inbound && r.Action == FirewallAction.Allow && r.IsEnable)
+                .Select(r => r.ApplicationName).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var path in Directory.GetFiles(Global.NetchDir, "*.exe", SearchOption.AllDirectories))
-                AddFwRule(Netch, path);
+                if (!covered.Contains(path)) AddFwRule(Netch, path);
         }
         catch (Exception e)
         {

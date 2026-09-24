@@ -101,7 +101,6 @@ public class Inbound4Sbox
 {
     public string type { get; set; }
     public string tag { get; set; }
-    public bool? sniff { get; set; }
     public string listen { get; set; }
     public int? listen_port { get; set; }
     public string interface_name { get; set; }

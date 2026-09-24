@@ -30,6 +30,9 @@ public static class MainController
     {
         using var releaser = await Lock.EnterAsync();
 
+        Global.Settings.DnsPolicy.Validate();
+        FakeIpModePolicy.Validate(mode);
+
         Log.Information("Start MainController: {Server} {Mode}", $"{server.ConfigType}", mode == null ? "Null" : $"[{(int)mode.Type}]{mode.i18NRemark}");
 
         await StopLockedAsync();
@@ -37,14 +40,21 @@ public static class MainController
         Server = server;
         Mode = mode;
 
-        var stage = "准备 DNS 服务";
+        var stage = "准备代理核心";
         void Phase(string name) => stage = name;
         try
         {
             if (!DnsRuntime.Strict && DnsRuntime.Protection.Active)
                 throw new MessageException("DNS 保护仍在生效。切换到允许本地解析前，请先使用“停止并恢复系统 DNS”。");
+            // Verify/extract bundled cores before touching DNS or firewall settings.
+            await Task.Run(() => BundledCoreManager.Prepare(Global.NetchDir));
+            if (Global.Settings.DnsPolicy.FakeIpEnabled)
+            {
+                Phase("检查 Fake-IP 地址池");
+                await Task.Run(() => FakeIpModePolicy.CheckNetworkConflicts());
+            }
             DnsRuntime.Ipv4Only = mode is TunMode;
-            Phase(stage);
+            Phase("准备 DNS 服务");
             await DnsRuntime.PrepareAsync();
             if (DnsRuntime.Strict)
             {
@@ -56,7 +66,7 @@ public static class MainController
                 else
                     _ = await V2rayConfigUtils.GenerateClientConfigAsync(server);
                 Phase("建立 DNS 防护");
-                await DnsRuntime.Protection.EnableAsync(mode is TunMode);
+                await DnsRuntime.Protection.EnableAsync(mode is TunMode, Global.Settings.DnsPolicy.FakeIpEnabled);
             }
             Phase("初始化网络");
             await Task.WhenAll(Task.Run(NativeMethods.RefreshDNSCache), Task.Run(Firewall.AddNetchFwRules));
@@ -88,12 +98,16 @@ public static class MainController
                 guard.Instance.EnableRaisingEvents = true;
                 guard.Instance.Exited += (_, _) =>
                 {
-                    if (ReferenceEquals(ServerController, guard)) DnsRuntime.Suspend();
+                    if (ReferenceEquals(ServerController, guard))
+                    {
+                        Log.Information("Core exited: {Core}; DNS will remain fail-closed", guard.Name);
+                        DnsRuntime.Suspend();
+                    }
                 };
             }
             Global.MainForm.StatusText(i18N.TranslateFormat("Starting {0}", ServerController.Name));
 
-            TryReleaseTcpPort(ServerController.Socks5LocalPort(), "Socks5");
+            TryReleaseTcpPort((ushort)DnsRuntime.ApplicationCorePort, "Socks5");
             Phase("启动代理核心");
             Socks5Server = await ServerController.StartAsync(server);
             Phase("连接远程 DNS");
@@ -113,6 +127,7 @@ public static class MainController
                 Phase("验证远程 DNS");
                 await DnsRuntime.Service!.ProbeAsync();
             }
+            DnsRuntime.ActivateFakeIp();
         }
         catch (Exception e)
         {
